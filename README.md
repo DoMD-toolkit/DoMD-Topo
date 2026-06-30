@@ -60,7 +60,7 @@ write_mols_to_sdf(rdmols, 'polyimide.sdf')
 
 * **`mols_config`** *(dict)*: Dictionary mapping CG bead types to their atomic SMILES definitions.
 * **`reaction_template`** *(dict)*: Dictionary containing reaction SMARTS rules for fragment connectivity.
-* **`xml_path`** *(str)*: Path to the GALAMOST CG `.xml` configuration file.
+* **`xml_path`** *(str)*: Path to the PyGAMD CG `.xml` configuration file.
 * **`reactions`** *(list, optional)*: Explicit ordered sequence of reactions. If `None`, automatically inferred from the XML `<bond>` section.
 * **`large`** *(int, default 500)*: Molecule size threshold. Molecules smaller than this use ETKDG directly; larger systems trigger chunk-based embedding optimization.
 * **`chunks_per_d`** *(int, default 1)*: Spatial grid subdivision factor for large polymer networks optimization.
