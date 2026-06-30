@@ -69,12 +69,30 @@ write_mols_to_sdf(rdmols, 'polyimide.sdf')
 
 ## 2. Input Formats
 
-### Monomer Definitions (SMILES Node Identity)
-Defines the internal atomic structure of individual coarse-grained (CG) beads. This abstraction completely decouples the user from rigid coordinate/topology files (like `.itp` or `.gro`), allowing users to easily adjust mapping resolutions on the fly by changing the input SMILES strings.
+The DoMD-Topo pipeline processes three distinct input components to bridge the gap between coarse-grained configurations and full-atom topologies.
 
-### Reaction Templates (SMARTS Connectivity Logic)
-Defines the graph modification logic using reaction SMARTS. Numerical atom maps (e.g., `[C:1]`) identify the active binding sites where bonds are broken or formed, while unmapped atoms define the required local chemical neighborhood without being altered.
+### 2.1 Coarse-Grained Configuration (XML File)
+The `.xml` file (GALAMOST format) stores the baseline physical architecture of the coarse-grained (CG) system. It must explicitly define:
+* **Positions**: The 3D coordinates ($x, y, z$) of each CG bead.
+* **Types**: The identity/label of each bead type (matching the keys in `mols_config`).
+* **Bonds**: The structural connectivity matrix defining which beads are linked together.
 
+### 2.2 Monomer Mapping Matrix (`mols_config`)
+This dictionary establishes the **Node Identity** by mapping each CG bead type name to its corresponding all-atom SMILES descriptor.
+* *Example*: `{'A': {'smiles': 'Nc1ccc(Oc2ccc(N)cc2)cc1', 'file': None}}`
+* *Significance*: This provides complete resolution independence. You can map a whole monomer to a single bead or split it into separate backbone and side-chain beads simply by adjusting the target SMILES strings, isolating the user from complex topology templates (e.g., `.itp`, `.rtp`).
+
+### 2.3 Reaction Rules & Atom Labeling (`reaction_template`)
+This section utilizes reaction SMARTS as a chemical language for subgraph matching and graph modification to define exactly how beads connect.
+
+#### Critical Concept: Atom Labeling / Numerical Mapping
+To correctly govern the connection logic, the reaction SMARTS must use explicit numerical mapping for reactive sites:
+
+* **Syntax (Labeled vs. Unlabeled Atoms)**: 
+  In a reaction SMARTS string like `[#7H2:1].[#6:3](=[#8:4])...`, the numerical identifiers (e.g., `:1`, `:3`) are critical. They define the **active atoms** that will explicitly undergo bond breaking or bond formation. 
+  Any *unlabeled atoms* in the SMARTS string serve strictly as the required "chemical context" (e.g., specifying that a reactive carbon must be part of a carbonyl group), ensuring they are matched but left completely unmodified.
+* **Function**: 
+  This explicit labeling mathematically enforces proper **regioselectivity** (such as Head-to-Tail alignment), **stereochemistry** (cis/trans controls), and **branching logic** during both the macroscopic CG assembly and the full-atom backmapping phases.
 ---
 
 ## 3. Design Philosophy & Workflows
