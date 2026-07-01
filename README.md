@@ -86,8 +86,7 @@ chunks_per_dimension = 1
 aa_mol_h, aa_graph = topology_builder(
         reactants_config, 
         reaction_template, 
-        cg_mol, 
-        mol_idx=i
+        cg_mol
     )
     
 # 2. Compute 3D coordinate conformers based on CG target layouts
