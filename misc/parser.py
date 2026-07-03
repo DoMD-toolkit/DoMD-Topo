@@ -169,6 +169,7 @@ def read_cg_topology(cg_system, residues: Dict) -> Tuple[nx.Graph, List[nx.Graph
             - cg_molecules (List[nx.Graph]): A list of subgraphs, each representing a distinct molecule
               (connected component).
     """
+    box = np.array([cg_system.box.lx, cg_system.box.ly, cg_system.box.lz]).astype(float) * 10
     cg_sys = nx.Graph()
     for bond in cg_system.data['bond']:
         bond_type, i, j = str(bond[0]), int(bond[1]), int(bond[2])
@@ -228,6 +229,7 @@ def read_cg_topology(cg_system, residues: Dict) -> Tuple[nx.Graph, List[nx.Graph
                     )
         cg_molecules.append(cg_rigid_mol)
     for cg_mol in cg_molecules:
+        cg_mol.graph['box'] = box
         is_rigid = False
         for res_id, node in enumerate(cg_mol):
             if cg_mol.nodes[node]['body'] >=0:

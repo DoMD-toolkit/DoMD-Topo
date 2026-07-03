@@ -1,6 +1,7 @@
 import networkx as nx
 import numpy as np
 from rdkit import Chem
+from rdkit.Chem import AllChem
 from typing import Dict, List, Tuple
 from domd_xyz.embed.optimize_orientation import Meta, optimize_res_orientation
 from misc.logger import logger
@@ -233,7 +234,6 @@ def embed_by_etkdg(
     base_conf = molecule.GetConformer(conf_id)
 
     # Normalize fragments at origin to match the global stitcher's protocol
-    _center_residues_at_origin(molecule, local2atoms, base_conf)
     all_local_coords = {a.GetIdx(): np.array(base_conf.GetAtomPosition(a.GetIdx())) for a in molecule.GetAtoms()}
 
     # Pass through the global stitcher to correctly align and translate to CG positions

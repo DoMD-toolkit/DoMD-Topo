@@ -158,18 +158,18 @@ def analyze_topology(molecule_graph: nx.Graph, cg_graph: nx.Graph) -> Tuple[Dict
     global2local: Dict[Any, int] = {}
     # Step 2: Extract existing mapping metadata from both graphs if available
     # Check if cg_graph has predefined 'local_res_id'
-    for cg_node, data in cg_graph.nodes(data=True):
-        if 'local_res_id' in data:
-            global2local[cg_node] = data['local_res_id']
+    #for cg_node, data in cg_graph.nodes(data=True):
+    #    if 'local_res_id' in data:
+    #        global2local[cg_node] = data['local_res_id']
 
-    # Cross-reference with molecule_graph's 'res_id' to complement or verify mapping
-    for atom_id, data in molecule_graph.nodes(data=True):
-        g_id = data['global_res_id']
-        if 'res_id' in data:
-            r_id = data['res_id']
-            # Integrity check: Ensure no conflicting mappings exist between the two graphs
-            if g_id in global2local and global2local[g_id] != r_id:
-                molecule_graph.nodes[atom_id]['res_id'] = global2local[g_id]
+    ## Cross-reference with molecule_graph's 'res_id' to complement or verify mapping
+    #for atom_id, data in molecule_graph.nodes(data=True):
+    #    g_id = data['global_res_id']
+    #    if 'res_id' in data:
+    #        r_id = data['res_id']
+    #        # Integrity check: Ensure no conflicting mappings exist between the two graphs
+    #        if g_id in global2local and global2local[g_id] != r_id:
+    #            molecule_graph.nodes[atom_id]['res_id'] = global2local[g_id]
 
     # Step 3: Fallback Logic - If no local tracking IDs were provided, build from scratch
     if not global2local or len(global2local) < len(cg_graph):

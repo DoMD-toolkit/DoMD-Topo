@@ -487,31 +487,6 @@ class Reactor(object):
                     ValueError: If a reaction template or reactant definition is missing, or if a reaction fails.
         """
         logger.info(f"Generating top for CG molecule {mol_idx} with residue num of {len(cg_mol)}")
-        if cg_mol.graph['is_rigid']:
-            t = cg_mol.graph['type']
-            if (self.reactants_meta[t].get('file') is None):
-                logger.warnning(f"Get no file for rigid molecule. Try to generate molecule from SMILES.")
-                if (self.reactants_meta[t].get('smiles') is None):
-                    logger.error(f"Get no smiles for rigid molecule.")
-                    raise
-                else:
-                    aa_mol = Chem.MolFromSmiles(self.reactants_meta[t]['smiles'])
-                    for a in aa_mol.GetAtoms():
-                        a.SetIntProp('res_id', 0)
-                        a.SetIntProp('global_res_id', 0)
-                        a.SetProp('res_name', t)
-            else:
-                aa_mol = Chem.MolFromPDBFile(self.reactants_meta[t]['file'], removeHs=False)
-                for a in aa_mol.GetAtoms():
-                    a.SetIntProp('res_id', 0)
-                    a.SetIntProp('global_res_id', 0)
-                    a.SetProp('res_name', t)
-            mol_meta = nx.Graph()
-            for n in cg_mol.graph['rigid_aidxs_map']:
-                mol_meta.add_node(n, atom_idx=cg_mol.graph['rigid_aidxs_map'][n], reacting_map={}, rm_atoms=set())
-            #aa_molecules.append(aa_mol)
-            #meta.append(mol_meta)
-            #continue
         aa_mol = Chem.RWMol()
         mol_meta = nx.Graph()
         global_count = 0

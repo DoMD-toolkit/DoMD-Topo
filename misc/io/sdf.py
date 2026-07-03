@@ -6,7 +6,7 @@ import tqdm
 from rdkit import Chem
 from rdkit.Geometry import Point3D
 from misc.parser import mols_to_nxgraphs, nxgraphs_to_mols
-def write_mols_to_sdf(mols, output_path, force_v3000=True):
+def write_mols_to_sdf(mols, output_path, force_v3000=True, fragments=False):
     """
     Writes a list of RDKit molecule objects into a single multi-molecule SDF file.
     Automatically preserves all atom properties and custom string metadata.
@@ -17,17 +17,40 @@ def write_mols_to_sdf(mols, output_path, force_v3000=True):
         force_v3000 (bool): If True, enforces V3000 format compliance (recommended for large systems).
     """
     # Initialize the SDWriter handler
-    writer = Chem.SDWriter(output_path)
+    if fragments:
+        writer = Chem.SDWriter(output_path)
+        if force_v3000:
+            writer.SetForceV3000(True)
+        RES_NUMS = ''
+        RES_NAMES = ''
+        BOX_TENSOR = mols[0].GetProp("BOX_TENSOR")
+        combined_mol = Chem.RWMol()
+        for idx, mol in tqdm.tqdm(enumerate(mols), total=len(mols), desc='writing fragments to SDF', disable=False):
+            if mol is None:
+                continue
+            # Append the current molecule to the combined molecule
+            combined_mol.InsertMol(mol)
+            # Update residue information
+            RES_NUMS += mol.GetProp("RES_NUMS") + ' '
+            RES_NAMES += mol.GetProp("RES_NAMES") + ' '
+        # Set combined properties
+        combined_mol.SetProp("RES_NUMS", RES_NUMS)
+        combined_mol.SetProp("RES_NAMES", RES_NAMES)
+        combined_mol.SetProp("BOX_TENSOR", BOX_TENSOR)
+        writer.write(combined_mol)
+        writer.close()
+    else:
+        writer = Chem.SDWriter(output_path)
 
-    if force_v3000:
-        writer.SetForceV3000(True)
+        if force_v3000:
+            writer.SetForceV3000(True)
 
-    for idx, mol in tqdm.tqdm(enumerate(mols), total=len(mols), desc='writing molecules to SDF', disable=False):
-        if mol is None:
-            continue
-        # SDWriter automatically reads and writes all tags set via mol.SetProp()
-        writer.write(mol)
+        for idx, mol in tqdm.tqdm(enumerate(mols), total=len(mols), desc='writing molecules to SDF', disable=False):
+            if mol is None:
+                continue
+            # SDWriter automatically reads and writes all tags set via mol.SetProp()
+            writer.write(mol)
 
-    # Crucial: Always close the stream to flush buffer and finalize the file structure
-    writer.close()
+        # Crucial: Always close the stream to flush buffer and finalize the file structure
+        writer.close()
 
