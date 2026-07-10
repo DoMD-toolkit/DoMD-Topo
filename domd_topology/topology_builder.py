@@ -3,7 +3,54 @@ import os
 from rdkit import Chem
 from misc.parser import mols_to_nxgraphs
 
+from collections import deque
+
+
 def reactions_search(cg_graph):
+    """Searches for reactions in the coarse-grained graph using a deterministic
+    Breadth-First Search (BFS) traversal, strictly preserving the path discovery direction.
+
+    Args:
+        cg_graph (networkx.Graph): Coarse-grained graph representation of the system.
+
+    Returns:
+        list: A list of reactions found in the cg_graph, each represented as a tuple (bondtype, i, j).
+              The direction i -> j strictly reflects the BFS exploration trajectory.
+    """
+    reactions = []
+    visited_nodes = set()
+    # Store undirected edges as a sorted tuple (min, max) to prevent processing the same edge twice,
+    # while allowing us to keep the actual discovery order (curr -> nbr) in the final reactions list.
+    visited_edges = set()
+    # Step 1: Sort all nodes globally to ensure BFS roots start from the smallest index numbers
+    global_sorted_nodes = sorted(list(cg_graph.nodes))
+    for root_node in global_sorted_nodes:
+        if root_node in visited_nodes:
+            continue
+        # Initialize BFS queue for the current connected component
+        queue = deque([root_node])
+        visited_nodes.add(root_node)
+        while queue:
+            curr_node = queue.popleft()
+            # Step 2: Sort neighbors to enforce the "smaller index first" expansion priority locally
+            sorted_neighbors = sorted(list(cg_graph.neighbors(curr_node)))
+            for nbr_node in sorted_neighbors:
+                # Generate a canonical edge key to check for duplicate undirected edge detection
+                edge_key = (min(curr_node, nbr_node), max(curr_node, nbr_node))
+                if edge_key not in visited_edges:
+                    visited_edges.add(edge_key)
+                    # Fetch edge data from the graph
+                    bond_data = cg_graph.edges[curr_node, nbr_node]
+                    bondtype = bond_data['bond_type']
+                    # CRITICAL: Append the reaction strictly in the direction of path discovery (curr_node -> nbr_node)
+                    reactions.append((bondtype, curr_node, nbr_node))
+                # If the neighbor node hasn't been discovered yet, push it to the queue
+                if nbr_node not in visited_nodes:
+                    visited_nodes.add(nbr_node)
+                    queue.append(nbr_node)
+    return reactions
+
+def reactions_search_(cg_graph):
     """Searches for reactions in the coarse-grained graph based on the provided reaction template.
 
     Args:
@@ -15,6 +62,7 @@ def reactions_search(cg_graph):
     """
     reactions = []
     for i, j, bond in cg_graph.edges(data=True):
+        i, j = sorted((i, j))
         bondtype = bond['bond_type']
         reactions.append((bondtype, i, j))
     return reactions
