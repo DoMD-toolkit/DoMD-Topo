@@ -44,7 +44,7 @@ def topology_builder(reactants_config, reaction_template, rigid_configs=None, cg
                              f"Please ensure that the whole rigid coarse-grained molecule with same body id.")
         body_id = body_ids[0]
         mol_type = f'R_{body_id}'
-        aa_file = reactants_config[body_id]['file']
+        aa_file = rigid_configs[body_id]['file']
         if os.path.exists(aa_file):
             aa_mol_h = Chem.MolFromPDBFile(aa_file, removeHs=False)
             for a in aa_mol_h.GetAtoms():
