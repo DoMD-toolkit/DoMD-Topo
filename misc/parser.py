@@ -545,6 +545,6 @@ def parse_cg_topology(
 
     cg_mols = _set_rigid_files(cg_mols, rigid_configs)
 
-    logger.info(
-        f"Successfully compiled system topology: Harvester collected {len(cg_mols)} isolated molecular networks.")
+    logger.info(f"Successfully compiled system topology: Harvester collected "
+                f"{len(cg_mols)} isolated molecular networks.")
     return cg_mols, box_tensor
