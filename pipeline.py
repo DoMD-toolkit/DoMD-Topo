@@ -1,11 +1,11 @@
 import logging
 
-from topology_builder import topology_builder
+from .topology_builder import topology_builder
 from rdkit import Chem
 
-from embed_molecule import embed_molecule
-from misc.io.sdf import write_mols_to_sdf
-from misc.parser import post_process_aa_mol, parse_cg_topology
+from .embed_molecule import embed_molecule
+from .misc.io.sdf import write_mols_to_sdf
+from .misc.parser import post_process_aa_mol, parse_cg_topology
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +38,8 @@ def run_sdf_mode(mols_config, reaction_template, cg_file_path, rigid_configs=Non
 
     for i, cg_mol in enumerate(cg_mols):
         # Topology building
-        aa_mol_h, aa_graph = topology_builder(mols_config, reaction_template, rigid_configs=rigid_configs,
-                                              cg_graph=cg_mol, reactions=reactions, mol_idx=i)
+        aa_mol_h, aa_graph = topology_builder(mols_config, reaction_template,
+                                              cg_graph=cg_mol, reactions=reactions)
         # Molecule embedding (using default safe thresholds for large systems)
         aa_mol_h, aa_graph = embed_molecule(aa_mol_h, cg_mol, aa_graph, box=box_tensor, large=large,
                                             chunk_per_d=chunks_per_d)
@@ -76,7 +76,7 @@ def run_xyz_mode(aa_mol, cg_mol, aa_graph, box_tensor, large=500, chunks_per_d=1
     return aa_mol, aa_graph
 
 
-def run_topo_mode(mols_config, reaction_template, cg_mol, rigid_configs=None, reactions=None):
-    aa_mol_h, aa_graph = topology_builder(mols_config, reaction_template, rigid_configs=rigid_configs, cg_graph=cg_mol,
+def run_topo_mode(mols_config, reaction_template, cg_mol, reactions=None):
+    aa_mol_h, aa_graph = topology_builder(mols_config, reaction_template, cg_graph=cg_mol,
                                           reactions=reactions)
     return aa_mol_h, aa_graph

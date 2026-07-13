@@ -7,8 +7,8 @@ import numpy as np
 import tqdm
 from rdkit import Chem
 
-from misc.io.xml import XmlParser
-from misc.logger import logger
+from .io.xml import XmlParser
+from .logger import logger
 
 bondorder_to_type = {
     0: Chem.rdchem.BondType.UNSPECIFIED,

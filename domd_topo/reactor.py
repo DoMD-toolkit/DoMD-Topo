@@ -6,10 +6,10 @@ import tqdm
 from rdkit import Chem
 from rdkit.Chem import rdChemReactions
 
-from misc.logger import logger
-from misc.parser import mols_to_nxgraphs, molecule_reader
-from domd_topo._mapping import process_reactants, atom_map, bond_map
-from domd_topo.lib import set_molecule_id_for_h
+from ..misc.logger import logger
+from ..misc.parser import mols_to_nxgraphs, molecule_reader
+from ._mapping import process_reactants, atom_map, bond_map
+from .lib import set_molecule_id_for_h
 
 
 def reaction_mol_mapping(reactions: list[tuple]) -> dict[int, set]:
@@ -191,7 +191,7 @@ class Reactor(object):
                 reaction_name, _info['cg_reactant_list'], _info['smarts'], _info.get("prod_idx")
             )
 
-    def process(self, cg_mol: nx.Graph, reactions: list, mol_idx=0) -> tuple[Chem.Mol, nx.Graph]:
+    def process(self, cg_mol: nx.Graph, reactions: list) -> tuple[Chem.Mol, nx.Graph]:
         """Processes a single CG molecule to generate its All-Atom structure.
 
                 Args:
@@ -199,7 +199,6 @@ class Reactor(object):
                         and edges represent connectivity.
                     reactions (list): List of reactions to apply.
                     rigid_configs (dict, optional): Configuration for rigid molecules, including file paths and mappings.
-                    mol_idx (int, optional): Index of the CG molecule for logging purposes. Defaults to 0.
 
                 Returns:
                     tuple: A tuple containing:
@@ -218,7 +217,6 @@ class Reactor(object):
             else:
                 non_rigid_nodes.add(n)
         rigid_groups = cg_mol.graph.get('rigid_groups')
-        logger.info(f"Generating top for CG molecule {mol_idx} with residue num of {len(cg_mol)}")
         aa_mol = Chem.RWMol()
         mol_meta = nx.Graph()
         rigid_mol_global2local = {}
@@ -327,7 +325,8 @@ class Reactor(object):
                     else:
                         logger.debug(f"local_res_id for res {m}: {cg_mol.nodes[m]['local_res_id']}")
                         atom.SetIntProp('res_id', cg_mol.nodes[m]['local_res_id'])
-            return aa_mol, mol_meta
+            aa_mol_h, mol_graph = post_process(aa_mol)
+            return aa_mol_h, mol_graph
         for edge in cg_mol.edges:
             mol_meta.add_edge(*edge)
         r__id = 0

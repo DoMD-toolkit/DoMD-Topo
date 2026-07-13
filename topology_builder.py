@@ -3,11 +3,11 @@ import os
 from domd_topo.lib import reactions_search
 from rdkit import Chem
 
-from domd_topo.reactor import Reactor
-from misc.parser import mols_to_nxgraphs
+from .domd_topo.reactor import Reactor
+from .misc.parser import mols_to_nxgraphs
 
 
-def topology_builder(reactants_config, reaction_template, rigid_configs=None, cg_graph=None, reactions=None, mol_idx=0):
+def topology_builder(reactants_config, reaction_template, rigid_configs=None, cg_graph=None, reactions=None):
     """Builds the all-atom topology from coarse-grained input using the Reactor class.
 
         Args:
@@ -16,7 +16,6 @@ def topology_builder(reactants_config, reaction_template, rigid_configs=None, cg
             rigid_configs (dict, optional): Configuration for rigid molecules, including file paths and mappings.
             cg_graph (networkx.Graph, optional): Coarse-grained graph representation of the system.
             reactions (list/tuple, optional): Explicit sequence of reactions. If None, inferred from cg_graph.
-            mol_idx (int, optional): Index of the molecule being processed (for logging purposes).
 
         Returns:
             tuple: A tuple containing:
@@ -49,5 +48,5 @@ def topology_builder(reactants_config, reaction_template, rigid_configs=None, cg
         if reactions is None:
             reactions = reactions_search(cg_graph)
         reactor = Reactor(reactants_config, reaction_template)
-        aa_mol_h, aa_graph = reactor.process(cg_graph, reactions, mol_idx=mol_idx)
+        aa_mol_h, aa_graph = reactor.process(cg_graph, reactions)
     return aa_mol_h, aa_graph

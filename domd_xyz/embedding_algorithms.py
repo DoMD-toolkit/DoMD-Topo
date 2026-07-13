@@ -5,16 +5,16 @@ import numpy as np
 from rdkit import Chem
 from rdkit.Chem import AllChem
 
-from domd_xyz.embed_with_cg_xyz import (
+from .embed_with_cg_xyz import (
     generate_local_fragment_coords,
     analyze_topology,
     get_best_alignment,
     rotate_confs,
     pbc
 )
-from domd_xyz.optimize_orientation import Meta, optimize_res_orientation
-from misc.logger import logger
-from misc.parser import nxgraphs_to_mols
+from .optimize_orientation import Meta, optimize_res_orientation
+from ..misc.logger import logger
+from ..misc.parser import nxgraphs_to_mols
 
 
 def assemble_and_stitch_system(

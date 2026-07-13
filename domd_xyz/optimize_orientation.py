@@ -7,7 +7,7 @@ import torch
 from scipy.optimize import minimize
 from torch import optim
 
-from misc.logger import logger
+from ..misc.logger import logger
 
 
 def optimization_by_chunk(chunk_per_d, connections, pos, local_frame_idx, trans, box, rot):

@@ -6,7 +6,7 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 from scipy.stats import circmean
 
-from misc.logger import logger
+from ..misc.logger import logger
 
 
 @nb.jit(nopython=True)
