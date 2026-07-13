@@ -7,7 +7,7 @@ from .domd_topo.reactor import Reactor
 from .misc.parser import mols_to_nxgraphs
 
 
-def topology_builder(reactants_config, reaction_template, rigid_configs=None, cg_graph=None, reactions=None):
+def topology_builder(reactants_config, reaction_template, cg_graph=None, reactions=None):
     """Builds the all-atom topology from coarse-grained input using the Reactor class.
 
         Args:
@@ -22,8 +22,7 @@ def topology_builder(reactants_config, reaction_template, rigid_configs=None, cg
                 - list[Chem.Mol]: List of reconstructed all-atom molecules.
                 - dict: Metadata associated with the reconstructed molecules.
     """
-    if rigid_configs is None:
-        rigid_configs = {}
+    rigid_configs = cg_graph.graph.get('rigid_configs', {})
     if cg_graph.graph['rigidity'] == 'RIGID':
         body_ids = cg_graph.graph['body_id']
         if len(body_ids) != 1:

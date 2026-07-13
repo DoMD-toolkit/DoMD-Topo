@@ -384,7 +384,7 @@ List[nx.Graph]:
                 subgraph.nodes[node_idx]['intra_mol_id'] = local_idx
 
         # -------------------------------------------------------------------------
-        subgraph_rigid_configs = {body_id: body_configs[body_id] for body_id in rigid_groups if body_id in body_configs}
+        subgraph_rigid_configs = {body_id: body_configs[body_id] for body_id in rigid_groups}
         subgraph.graph['rigid_configs'] = subgraph_rigid_configs
         for body_id in rigid_groups:
 
