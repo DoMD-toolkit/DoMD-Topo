@@ -1,26 +1,42 @@
-3-Clause BSD NON-AI License
+SOFTWARE LICENSE AGREEMENT 
+(NON-COMMERCIAL & NO-AI TRAINING USE ONLY)
 
-Copyright (c) 2026, DoMD-Toolkit Group
+Copyright (c) 2026 DoMD-Toolkit Group. All rights reserved.
 
-Redistribution and use in source and binary forms, with or without modification,
-are permitted provided that the following conditions are met:
+1. DEFINITIONS
+"Software" refers to the source code, object code, documentation, weights, 
+and any related data provided under this Agreement.
+"Commercial Use" means any use of the Software for financial gain, business 
+operations, marketing, or commercial research and development.
+"AI/ML Training" means using the Software or any derivatives thereof as input, 
+training data, or fine-tuning datasets for machine learning models, neural 
+networks, artificial intelligence systems, or large language models (LLMs).
 
-1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+2. GRANT OF LICENSE
+Subject to the terms of this Agreement, the Licensor grants you a personal, 
+non-exclusive, non-transferable, royalty-free, revocable license to view, 
+download, execute, and modify the Software solely for academic research, 
+personal education, and non-commercial experimentation purposes.
 
-2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer
-in the documentation and/or other materials provided with the distribution.
+3. RESTRICTIONS
+By using the Software, you agree to the following absolute restrictions:
+(a) NO COMMERCIAL USE: You shall not use the Software, or any portion thereof, 
+    for any Commercial Use.
+(b) NO AI TRAINING: You shall not use the Software, or any portion thereof, 
+    for AI/ML Training. Generating or training commercial or open-source 
+    AI models using this Software is strictly prohibited.
+(c) REDISTRIBUTION: Any permitted redistribution of the Software must retain 
+    this exact License Agreement and all original copyright notices.
 
-3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products
-derived from this software without specific prior written permission.
+4. TERMINATION
+This license terminates automatically if you breach any term of this Agreement. 
+Upon termination, you must cease all use and destroy all copies of the Software.
 
-4. The source code and the binary form, and any modifications made to them may not be used for the purpose of training or improving machine learning algorithms,
-including but not limited to artificial intelligence, natural language processing, or data mining. This condition applies to any derivatives,
-modifications, or updates based on the Software code. Any usage of the source code or the binary form in an AI-training dataset is considered a breach of this License.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES,
-INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
-IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY,
-OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
-OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
-EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+5. DISCLAIMER OF WARRANTY
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR 
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, 
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE 
+SOFTWARE.
