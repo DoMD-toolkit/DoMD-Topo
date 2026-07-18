@@ -1,11 +1,11 @@
 import logging
 
-from .topology_builder import topology_builder
 from rdkit import Chem
 
-from .embed_molecule import embed_molecule
-from .misc.io.sdf import write_mols_to_sdf
-from .misc.parser import post_process_aa_mol, parse_cg_topology
+from embed_molecule import embed_molecule
+from misc.io.sdf import write_mols_to_sdf
+from misc.parser import post_process_aa_mol
+from topology_builder import topology_builder
 
 logger = logging.getLogger(__name__)
 

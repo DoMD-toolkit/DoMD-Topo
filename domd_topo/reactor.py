@@ -3,13 +3,15 @@ from typing import Any, Union
 
 import networkx as nx
 import tqdm
+from numba.core.types import double
 from rdkit import Chem
 from rdkit.Chem import rdChemReactions
 
-from ..misc.logger import logger
-from ..misc.parser import mols_to_nxgraphs, molecule_reader
-from ._mapping import process_reactants, atom_map, bond_map
-from .lib import set_molecule_id_for_h
+from domd_topo._mapping import process_reactants, atom_map, bond_map
+from domd_topo.lib import set_molecule_id_for_h
+from fast_sanitize import fast_sanitize
+from misc.logger import logger
+from misc.parser import mols_to_nxgraphs
 
 
 def reaction_mol_mapping(reactions: list[tuple]) -> dict[int, set]:
@@ -83,14 +85,14 @@ class Reaction(object):
                     smarts (str): Reaction SMARTS string.
                     prod_idx (int, optional): Index of the product to track. Defaults to None.
         """
-        self.cg_reactant_list = cg_reactant_list
+        self.cg_reactant_list = [tuple(cg) for cg in cg_reactant_list]
         self.reaction_name = name
         self.reaction = rdChemReactions.ReactionFromSmarts(smarts)
         self.smarts = smarts
         self.prod_idx = prod_idx
         self.reaction_maps = {}
 
-    def build_reaction_maps(self, cg_reactants, molecules):
+    def build_reaction_maps(self, cg_reactants, molecules, rebuild=False):
         """Pre-calculates and caches atom and bond mappings for a set of reactants.
 
                 Runs the reaction on the provided molecules to determine how atoms map
@@ -103,7 +105,7 @@ class Reaction(object):
                 Raises:
                     ValueError: If the reaction produces no products.
         """
-        if self.reaction_maps.get(cg_reactants) is None:
+        if rebuild or self.reaction_maps.get(cg_reactants) is None:
             self.reaction_maps[cg_reactants] = []
             reactants = process_reactants(molecules)
             products = self.reaction.RunReactants(reactants)
@@ -137,7 +139,7 @@ def allowed_p(reacted_atoms, cg_reactants, reaction):
                 # reaction 1 takes {0,1},{10,11} but reaction 2 takes {0,1,2,3},{10,11,12,13}
                 # if reaction 1 happened with (0,1} already, reacted atoms has intersection with
                 # reaction 2
-                # if set.issubset(set(reaction map[0][ri]),reacted atoms[ri]): 
+                # if set.issubset(set(reaction map[0][ri]),reacted atoms[ri]):
                 # only idle function groups
                 # multi-step reaction info are considered as reaction info with all reactants in one step.
                 # FOR ANY ATOM, THERE IS ONLY ONE REACTION, therefore intersection is fine.
@@ -147,7 +149,7 @@ def allowed_p(reacted_atoms, cg_reactants, reaction):
     return None, None
 
 
-def post_process(aa_mol: Union[Chem.Mol, Chem.RWMol]) -> tuple[Chem.Mol, nx.Graph]:
+def post_process(aa_mol: Chem.Mol, fast=False) -> tuple[Chem.Mol, nx.Graph]:
     """Post-processes an all-atom molecule to generate its corresponding graph representation.
 
             Args:
@@ -158,7 +160,11 @@ def post_process(aa_mol: Union[Chem.Mol, Chem.RWMol]) -> tuple[Chem.Mol, nx.Grap
                     - aa_mol (Chem.Mol): The processed all-atom RDKit molecule.
                     - mol_graph (nx.Graph): Graph representation of the molecule with atom and bond properties.
     """
-    Chem.SanitizeMol(aa_mol)
+    if fast:
+        fast_sanitize(aa_mol)
+    else:
+        Chem.SanitizeMol(aa_mol)
+
     aa_mol_h = Chem.AddHs(aa_mol)
     set_molecule_id_for_h(aa_mol_h)
     mol_graph = mols_to_nxgraphs([aa_mol_h])[0]
@@ -179,17 +185,21 @@ class Reactor(object):
             reaction_templates (dict): Dictionary of Reaction objects.
     """
 
-    def __init__(self, reactants_meta: dict[str, dict[str, str]], reaction_templates: dict[str, dict[str, Any]]):
-        self.reactants_meta = reactants_meta
+    def __init__(self, reactant_config: dict[str, dict[str, Any]], reaction_templates: dict[str, dict[str, Any]],
+                 rigid_config: dict[str, dict[str, Any]], fast_sanitize_p: bool = False):
+        self.reactants_meta = reactant_config
         # self.cg_molecules = None
         # self.aa_molecules = []
         # self.meta = []
+        self.rigid_configs = rigid_config
         self.reaction_templates = {}
         for reaction_name in reaction_templates:
             _info = reaction_templates[reaction_name]
             self.reaction_templates[reaction_name] = Reaction(
                 reaction_name, _info['cg_reactant_list'], _info['smarts'], _info.get("prod_idx")
             )
+        self.fast_sanitize_p = fast_sanitize_p
+        # print(f"Initialized Reactor with {len(self.reaction_templates)} reaction templates.")
 
     def process(self, cg_mol: nx.Graph, reactions: list) -> tuple[Chem.Mol, nx.Graph]:
         """Processes a single CG molecule to generate its All-Atom structure.
@@ -198,8 +208,6 @@ class Reactor(object):
                     cg_mol (nx.Graph): Coarse-Grained graph where nodes represent monomers/reactants
                         and edges represent connectivity.
                     reactions (list): List of reactions to apply.
-                    rigid_configs (dict, optional): Configuration for rigid molecules, including file paths and mappings.
-
                 Returns:
                     tuple: A tuple containing:
                         - aa_molecule (Chem.RWMol): The generated all-atom RDKit molecule.
@@ -208,104 +216,76 @@ class Reactor(object):
                 Raises:
                     ValueError: If a reaction template or reactant definition is missing, or if a reaction fails.
         """
-        rigid_configs = cg_mol.graph.get('rigid_configs', {})
-        rigid_nodes = set()
-        non_rigid_nodes = set()
-        for n in cg_mol.nodes:
-            if cg_mol.nodes[n].get('body') >= 0:
-                rigid_nodes.add(n)
-            else:
-                non_rigid_nodes.add(n)
-        rigid_groups = cg_mol.graph.get('rigid_groups')
         aa_mol = Chem.RWMol()
         mol_meta = nx.Graph()
-        rigid_mol_global2local = {}
         global_count = 0
-        rigid_types = set()
-        for body_id in rigid_groups:
-            file = rigid_configs[body_id]['file']
-            mapping = rigid_configs[body_id]['mapping']  # react_site cg_node to rigid_mol atom_idx
-            rigid_mol = molecule_reader(file)
-            positions = rigid_mol.GetConformer(0).GetPositions()
-
-            rigid_nodes_ = rigid_groups[body_id]
-            rigid_mol_local2global = {}
-            for atom_id in range(rigid_mol.GetNumAtoms()):
-                rigid_mol_local2global[atom_id] = atom_id + global_count
-                rigid_mol_global2local[atom_id + global_count] = atom_id
-                atom = rigid_mol.GetAtomWithIdx(atom_id)
-                aa_mol.AddAtom(atom)
-            for bond in rigid_mol.GetBonds():
-                aa_mol.AddBond(
-                    bond.GetBeginAtomIdx() + global_count,
-                    bond.GetEndAtomIdx() + global_count,
-                    bond.GetBondType()
-                )
-                stereo = bond.GetStereo()
-                bond_created = aa_mol.GetBondBetweenAtoms(
-                    bond.GetBeginAtomIdx() + global_count,
-                    bond.GetEndAtomIdx() + global_count,
-                )
-                bond_created.SetStereo(stereo)
-                bond_created.SetBondDir(bond.GetBondDir())
-            global_count += rigid_mol.GetNumAtoms()
-            for atom_id in range(rigid_mol.GetNumAtoms()):
-                atom = aa_mol.GetAtomWithIdx(rigid_mol_local2global[atom_id])
-                atom.SetIntProp('global_res_id', -body_id - 1)
-                atom.SetIntProp('res_id', -body_id - 1)
-                atom.SetIntProp('body_id', body_id)
-                atom.SetIntProp('intra_mol_id', rigid_mol_global2local[atom.GetIdx()])
-                atom.SetProp('res_name', str(cg_mol.nodes[list(rigid_nodes_)[0]].get('type')))
-                atom.SetIntProp('x', int(positions[atom_id][0] * 10000))
-                atom.SetIntProp('y', int(positions[atom_id][1] * 10000))
-                atom.SetIntProp('z', int(positions[atom_id][2] * 10000))
-            for node in rigid_nodes_:
-                local_res_id = cg_mol.nodes[node].get(
-                    'intra_mol_id')  # intra_mol_id is the local residue id in the rigid molecule, which is used to map to the rigid molecule atom index.
-                rigid_type = cg_mol.nodes[node].get('type')
-                rigid_types.add(rigid_type)
-                if local_res_id in mapping:
-                    rigid_frag_atom_mapping = cg_mol.nodes[node].get('frag_atom_mapping')
-                    rigid_react_site_atom_id_list = sorted(mapping[local_res_id]['atom_index'])
-                    atom_idx = {rigid_frag_atom_mapping[i]: rigid_mol_local2global[rigid_react_site_atom_id_list[i]] for
-                                i in range(len(rigid_react_site_atom_id_list))}
-
-                    mol_meta.add_node(node, atom_idx=atom_idx, reacting_map={}, rm_atoms=set())
-                    for rigid_react_site_atom_id in rigid_react_site_atom_id_list:
-                        atom = aa_mol.GetAtomWithIdx(rigid_mol_local2global[rigid_react_site_atom_id])
-                        atom.SetIntProp('global_res_id', int(node))
-                        atom.SetIntProp('res_id', local_res_id)
-                else:
-                    mol_meta.add_node(node, atom_idx={}, reacting_map={}, rm_atoms=set())
-
-        for node in non_rigid_nodes:
+        node_to_local_res_id = {node: i for i, node in enumerate(cg_mol.nodes)}
+        rigid_body_nodes = {}
+        for node, data in cg_mol.nodes(data=True):
+            if data['body_id'] >= 0:
+                rigid_body_nodes.setdefault(data['body_id'], []).append(node)
+        processed_body_ids = set()
+        for node in cg_mol.nodes:
+            node_data = cg_mol.nodes[node]
+            body_id = node_data['body_id']
+            if body_id >= 0:
+                if body_id in processed_body_ids:
+                    continue
+                processed_body_ids.add(body_id)
+                body_nodes = rigid_body_nodes[body_id]
+                rigid_name = node_data['rigid_name']
+                rigid_data = self.rigid_configs[rigid_name]
+                rigid_mol = rigid_data['mol']
+                positions = rigid_data['pos']
+                rigid_mol_local2global = {i: i + global_count for i in range(rigid_mol.GetNumAtoms())}
+                for atom_id in range(rigid_mol.GetNumAtoms()):
+                    aa_mol.AddAtom(rigid_mol.GetAtomWithIdx(atom_id))
+                for bond in rigid_mol.GetBonds():
+                    bi = rigid_mol_local2global[bond.GetBeginAtomIdx()]
+                    bj = rigid_mol_local2global[bond.GetEndAtomIdx()]
+                    aa_mol.AddBond(bi, bj, bond.GetBondType())
+                    bond_created = aa_mol.GetBondBetweenAtoms(bi, bj)
+                    bond_created.SetStereo(bond.GetStereo())
+                    bond_created.SetBondDir(bond.GetBondDir())
+                    if bond.GetStereo() in (Chem.BondStereo.STEREOZ, Chem.BondStereo.STEREOE):
+                        stereo_atoms = list(bond.GetStereoAtoms())
+                        if len(stereo_atoms) == 2:
+                            bond_created.SetStereoAtoms(
+                                rigid_mol_local2global[stereo_atoms[0]],
+                                rigid_mol_local2global[stereo_atoms[1]]
+                            )
+                for atom_id in range(rigid_mol.GetNumAtoms()):
+                    atom = aa_mol.GetAtomWithIdx(rigid_mol_local2global[atom_id])
+                    atom.SetIntProp('body_id', int(body_id))
+                    atom.SetIntProp('intra_mol_id', int(atom_id))
+                    atom.SetDoubleProp('x', double(positions[atom_id][0]))
+                    atom.SetDoubleProp('y', double(positions[atom_id][1]))
+                    atom.SetDoubleProp('z', double(positions[atom_id][2]))
+                for rigid_node in body_nodes:
+                    rigid_node_data = cg_mol.nodes[rigid_node]
+                    rigid_atom_idx = rigid_node_data['atom_idx']
+                    if rigid_node_data['mapping_node']:
+                        atom_idx = {i: rigid_mol_local2global[aa_idx]
+                                    for i, aa_idx in enumerate(rigid_atom_idx)}
+                    else:
+                        atom_idx = {aa_idx: rigid_mol_local2global[aa_idx] for aa_idx in rigid_atom_idx}
+                    mol_meta.add_node(rigid_node, atom_idx=atom_idx, reacting_map={}, rm_atoms=set())
+                global_count += rigid_mol.GetNumAtoms()
+                continue
+            reactant_type = node_data['type']
+            reactant_molecule = self.reactants_meta[reactant_type]['mol']
             atom_idx = {}
-            reactant = cg_mol.nodes[node]
-            reactant_molecule = Chem.MolFromSmiles(reactant['smiles'])
             for atom_id in range(reactant_molecule.GetNumAtoms()):
-                atom = reactant_molecule.GetAtomWithIdx(atom_id)
-                aa_mol.AddAtom(atom)
+                aa_mol.AddAtom(reactant_molecule.GetAtomWithIdx(atom_id))
                 atom_idx[atom_id] = atom_id + global_count
             for bond in reactant_molecule.GetBonds():
-                aa_mol.AddBond(
-                    bond.GetBeginAtomIdx() + global_count,
-                    bond.GetEndAtomIdx() + global_count,
-                    bond.GetBondType()
-                )
-                stereo = bond.GetStereo()
-                bond_created = aa_mol.GetBondBetweenAtoms(
-                    bond.GetBeginAtomIdx() + global_count,
-                    bond.GetEndAtomIdx() + global_count,
-                )
-                bond_created.SetStereo(stereo)
+                bi = bond.GetBeginAtomIdx() + global_count
+                bj = bond.GetEndAtomIdx() + global_count
+                aa_mol.AddBond(bi, bj, bond.GetBondType())
+                bond_created = aa_mol.GetBondBetweenAtoms(bi, bj)
+                bond_created.SetStereo(bond.GetStereo())
                 bond_created.SetBondDir(bond.GetBondDir())
-            for bond in reactant_molecule.GetBonds():
-                stereo = bond.GetStereo()
-                bond_created = aa_mol.GetBondBetweenAtoms(
-                    bond.GetBeginAtomIdx() + global_count,
-                    bond.GetEndAtomIdx() + global_count,
-                )
-                if stereo in (Chem.BondStereo.STEREOZ, Chem.BondStereo.STEREOE):
+                if bond.GetStereo() in (Chem.BondStereo.STEREOZ, Chem.BondStereo.STEREOE):
                     stereo_atoms = list(bond.GetStereoAtoms())
                     if len(stereo_atoms) == 2:
                         bond_created.SetStereoAtoms(stereo_atoms[0] + global_count, stereo_atoms[1] + global_count)
@@ -317,14 +297,9 @@ class Reactor(object):
                 for idx in molecule['atom_idx'].values():
                     atom = aa_mol.GetAtomWithIdx(idx)
                     atom.SetIntProp('global_res_id', int(m))
-                    atom.SetProp('res_name', str(cg_mol.nodes[m].get('type')))
+                    atom.SetProp('res_name', str(cg_mol.nodes[m]['type']))
                     logger.debug(f"global_res_id for atom {idx} in residue {m} is {m}")
-                    if cg_mol.nodes[m].get('local_res_id') is None:
-                        logger.warning(f"No local_res_id found in cg_molecule!")
-                        atom.SetIntProp('res_id', -1)
-                    else:
-                        logger.debug(f"local_res_id for res {m}: {cg_mol.nodes[m]['local_res_id']}")
-                        atom.SetIntProp('res_id', cg_mol.nodes[m]['local_res_id'])
+                    atom.SetIntProp('local_res_id', node_to_local_res_id[m])
             aa_mol_h, mol_graph = post_process(aa_mol)
             return aa_mol_h, mol_graph
         for edge in cg_mol.edges:
@@ -345,27 +320,34 @@ class Reactor(object):
                 if _tuple in rxn_tpls.cg_reactant_list:
                     reactants_order = _order
                     reactants_tuple = _tuple
+            # print(rxn_tpls.cg_reactant_list)
             if not reactants_order:
                 raise ValueError(f"Reaction {r} for reactants ({_reactants_tuple}) is not defined!")
 
             _molecules = []
+            rebuild_reaction_maps = False
             for i, t in enumerate(reactants_tuple):
                 meta = cg_mol.nodes[reactants_order[i]]
-                if t in rigid_types:
-                    if meta.get('smarts'):
-                        _molecules.append(Chem.MolFromSmarts(meta['smarts']))
-                    elif meta.get('smiles'):
-                        _molecules.append(Chem.MolFromSmiles(meta['smiles']))
+                if meta['body_id'] >= 0:
+                    if not meta['mapping_node']:
+                        raise ValueError(f"Rigid CG node {reactants_order[i]} is not a reaction mapping node.")
+                    rebuild_reaction_maps = True
+                    if meta.get('smarts') is not None:
+                        rigid_fragment = Chem.MolFromSmarts(meta['smarts'])
+                        if rigid_fragment is None:
+                            raise ValueError(f"Invalid SMARTS for rigid CG node {reactants_order[i]}: {meta['smarts']}")
+                        _molecules.append(rigid_fragment)
+                    elif len(meta['atom_idx']) == 1:
+                        rigid_mol = self.rigid_configs[meta['rigid_name']]['mol']
+                        rigid_fragment = Chem.RWMol()
+                        rigid_fragment.AddAtom(Chem.Atom(rigid_mol.GetAtomWithIdx(meta['atom_idx'][0])))
+                        _molecules.append(rigid_fragment.GetMol())
                     else:
                         raise ValueError(
-                            f"Rigid reactant type '{t}' requires either 'smarts' or 'smiles' in reactants_meta, but neither was found.")
+                            f"Rigid CG node {reactants_order[i]} requires SMARTS when atom_idx contains more than one atom.")
                 else:
-                    if meta.get('smiles'):
-                        _molecules.append(Chem.MolFromSmiles(meta['smiles']))
-                    else:
-                        raise ValueError(
-                            f"Flexible reactant type '{t}' requires 'smiles' in reactants_meta, but it was not found.")
-            rxn_tpls.build_reaction_maps(reactants_tuple, _molecules)
+                    _molecules.append(self.reactants_meta[t]['mol'])
+            rxn_tpls.build_reaction_maps(reactants_tuple, _molecules, rebuild=rebuild_reaction_maps)
 
             if len(reactants_tuple) == 2:
                 if reactants_tuple[0] == reactants_tuple[1]:
@@ -447,16 +429,11 @@ class Reactor(object):
                 atom.SetIntProp('global_res_id', int(m))
                 atom.SetProp('res_name', str(cg_mol.nodes[m]['type']))
                 logger.debug(f"global_res_id for atom {idx} in residue {m} is {m}")
-                if cg_mol.nodes[m].get('local_res_id') is None:
-                    logger.warning(f"No local_res_id found in cg_molecule!")
-                    atom.SetIntProp('res_id', -1)
-                else:
-                    logger.debug(f"local_res_id for res {m}: {cg_mol.nodes[m]['local_res_id']}")
-                    atom.SetIntProp('res_id', cg_mol.nodes[m]['local_res_id'])
+                atom.SetIntProp('local_res_id', node_to_local_res_id[m])
             rm_all.extend(list(molecule['rm_atoms']))
 
         rm_all = sorted(list(set(rm_all)), reverse=True)
         for bi in tqdm.tqdm(rm_all, total=len(rm_all), desc='removing atom', disable=True):
             aa_mol.RemoveAtom(bi)
-        aa_mol_h, mol_graph = post_process(aa_mol)
+        aa_mol_h, mol_graph = post_process(aa_mol.GetMol(), self.fast_sanitize_p)
         return aa_mol_h, mol_graph

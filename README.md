@@ -1,248 +1,411 @@
-# DoMD-Topo
+# DoMD-Conf
 
 ```text
 ██████╗  ██████╗ ███╗   ███╗██████╗        ██████╗ ██████╗ ███╗   ██╗███████╗
 ██╔══██╗██╔═══██╗████╗ ████║██╔══██╗      ██╔════╝██╔═══██╗████╗  ██║██╔════╝
-██║  ██║██║   ██║██╔████╔██║██║  ██║█████╗██║     ██║   ██║██╔██╗ ██║█████╗  
-██║  ██║██║   ██║██║╚██╔╝██║██║  ██║╚════╝██║     ██║   ██║██║╚██╗██║██╔══╝  
-██████╔╝╚██████╔╝██║ ╚═╝ ██║██████╔╝      ╚██████╗╚██████╔╝██║ ╚████║██║     
-╚═════╝  ╚═════╝ ╚═╝     ╚═╝╚═════╝        ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝╚═╝     
+██║  ██║██║   ██║██╔████╔██║██║  ██║█████╗██║     ██║   ██║██╔██╗ ██║█████╗
+██║  ██║██║   ██║██║╚██╔╝██║██║  ██║╚════╝██║     ██║   ██║██║╚██╗██║██╔══╝
+██████╔╝╚██████╔╝██║ ╚═╝ ██║██████╔╝      ╚██████╗╚██████╔╝██║ ╚████║██║
+╚═════╝  ╚═════╝ ╚═╝     ╚═╝╚═════╝        ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝╚═╝
 ```
 
-A lightweight **"Chemical Compilation"** engine driven by the SMILES/SMARTS-driven Coarse-Graining/Fine-Graining (
-S-CGFG) framework to reconstruct All-Atom (AA) configurations from Coarse-Grained (CG) models.
+DoMD-Conf reconstructs all-atom (AA) molecular topologies and coordinates from coarse-grained (CG) configurations. It supports flexible molecules, crosslinked networks, and rigid–flexible systems through user-defined reaction templates.
 
----
+## 1. Online service
 
-## 1. System Specifications & Input Formats
+1. Prepare one ZIP archive containing `config.json` and all referenced input files.
+2. Upload the ZIP archive to the DoMD Topology page.
+3. Select **Topology Only** or **SDF Mode** and submit the task.
+4. Use the returned Task ID to monitor the task and download the result ZIP.
 
-The reconstruction pipeline maps localized chemical descriptors and graph topologies into fully backmapped,
-coordinate-embedded macromolecular spaces.
+The Task ID can also be supplied directly to DoMD-FF for subsequent force-field generation.
 
-### 1.1 Coarse-Grained Graph (`cg_mol`)
+### 1.1 Input ZIP
 
-A NetworkX graph representation of the coarse-grained layout. The structure must comply with the following attributes:
+All files must be placed together in the ZIP root directory. Do not place them in subdirectories.
 
-* **Graph Attributes**:
-    * `is_rigid` *(bool)*: Designates whether the entire subsystem operates as a static, non-deformable rigid body.
-* **Node Attributes (Per Bead)**:
-    * `type` *(str)*: Coarse-grained bead classification string matching keys in `reactants_config`.
-    * `smiles` *(str)*: All-atom composition string associated with the local bead template.
-    * `x` *(np.ndarray)*: Target 3D spatial coordinate vector (shape (3,)) of the CG bead center.
-    * `body` *(int)*: Structural rigid-body grouping tracker index.
-* **Edge Attributes (Per Connection)**:
-    * `bond_type` *(str/object)*: Structural link parameters defining localized connectivity boundaries between beads.
+```text
+input.zip
+├── config.json
+├── cg_conf.xml              # or cg_conf.gsd
+├── reactions.txt            # optional
+└── rigid.pdb                # optional; rigid.sdf is also supported
+```
 
-### 1.2 Reactants Dictionary (`reactants_config`)
+#### `config.json`
 
-Establishes baseline molecular identities by mapping active CG bead types to their corresponding all-atom SMILES string
-descriptors.
+The configuration contains five main entries:
 
-```python
-reactants_config = {
-    'A': {'smiles': 'Nc1ccc(Oc2ccc(N)cc2)cc1', 'file': None},
-    'B': {'smiles': 'O1C(=O)c2cc(Oc3cc4C(=O)OC(=O)c4cc3)ccc2C1=O', 'file': None},
+```json
+{
+    "cg_topology_file": "cg_conf.xml",
+    "reaction_file": "reactions.txt",
+    "reactant_config": {},
+    "reaction_template": {},
+    "rigid_config": {}
 }
 ```
 
-### 1.3 Connection Templates (`reaction_template`)
+| Entry | Required | Description |
+|---|---------:|---|
+| `cg_topology_file` |      Yes | CG configuration in XML or GSD format. Systems containing rigid bodies require XML. |
+| `reaction_file` |       No | Text file containing the ordered reaction sequence. Users should provide this file whenever the reaction history is known. If omitted, reactions are inferred by BFS, which may produce an incorrect order for complex crosslinked or reaction-order-dependent systems. |
+| `reactant_config` |      Yes | AA definitions of flexible CG bead types. |
+| `reaction_template` |      Yes | Reaction SMARTS and allowed ordered CG reactant types. |
+| `rigid_config` |       No | AA templates and CG-to-AA mappings for rigid bodies. Use `{}` when no rigid body is present. |
 
-Directs the localized topological assembly using reaction SMARTS for subgraph parsing and graph modification.
+#### Flexible reactants
 
-```python
-reaction_template = {
-    'B-A': {
-        'cg_reactant_list': [('A', 'B')],
-        'smarts': '[#7H2:1].[#6:3](=[#8:4])[#8:2][#6:5]=[#8:6]>>[#6:3](=[#8:4])[#7:1][#6:5]=[#8:6].[#8:2]',
-        'prod_idx': [0]
+Each flexible CG type must provide at least one molecular source:
+
+```json
+{
+    "A": {
+        "smiles": "C=CC(=O)O",
+        "file": null
     }
 }
 ```
 
-#### A. Critical Concept: Atom Labeling / Numerical Mapping
+`file` may point to a PDB or SDF file. When both `file` and `smiles` are supplied, the file is used.
 
-To govern connection rules without ambiguity, reaction SMARTS must enforce precise atom map labels:
+#### Reaction templates
 
-* **Labeled Atoms**: Atoms containing explicit map identifiers (e.g., `:1` or `:3`) define the **reactive centers**
-  where chemical bonds are broken, converted, or formed.
-* **Unlabeled Atoms**: Serve strictly as **chemical environment context** (e.g., specifying that a reactive carbon must
-  belong to a cyclic anhydride ring). They guarantee matching fidelity but remain chemically unmodified.
-
-#### B. State Verification via `allow_p` & the Reacted Atom Set
-
-To guarantee valid chemical valency boundaries and prevent impossible hyper-branched structures, the core compiler
-implements an internal validation engine:
-
-* Every reactive atom index identified by a map label during a match pass is recorded within a unified **Reacted Atom
-  Set**.
-* Before committing a structural alteration, the engine validates the `allow_p` (Allow Polymerization) flag. If the
-  mapped atoms of a candidate reaction site already exist in the Reacted Atom Set, the reaction pass is blocked,
-  protecting the true valency limits of the atoms.
-
-> ⚠️ **Reaction Order Dependency Tracking**
-> Because matching operates sequentially against static monomer references, graph modification outputs depend on
-> historical order (e.g., linking block A to B prior to attaching C).
-> * **Explicit Order (Recommended)**: Reaction tracking matrices are read directly from spatial bond trajectories saved
-    by the coarse-grained engine (e.g., HOOMD-blue/PyGAMD) during the MD run.
-> * **Implicit Order (Fallback)**: If chronological records are missing, a Breadth-First Search (BFS) sorting script
-    infers default connection pathways. Complex crossing networks might occasionally suffer from premature `allow_p`
-    blockades under this fallback.
-
----
-
-## 2. Core APIs
-
-### 2.1 `topology_builder`
-
-Constructs macroscopic full-atom structural connection graphs by processing reaction blue-prints across the input
-coarse-grained system.
-
-```python
-aa_mol_h, aa_graph = topology_builder(reactants_config, reaction_template, cg_mol)
+```json
+{
+    "B-A": {
+        "cg_reactant_list": [["A", "B"]],
+        "smarts": "C(=O)[#8H1:1].[#6:2][#8H1:3]>>C(=O)[#8:3][#6:2].[#8:1]",
+        "prod_idx": [0]
+    }
+}
 ```
 
-| Parameter               | Type       | Description                                                                         |
-|:------------------------|:-----------|:------------------------------------------------------------------------------------|
-| **`reactants_config`**  | `dict`     | Base dictionary mapping CG bead identifiers to raw monomer SMILES layouts.          |
-| **`reaction_template`** | `dict`     | Transformation templates specifying structural reaction SMARTS and product indices. |
-| **`cg_mol`**            | `nx.Graph` | Source coarse-grained system layout containing target node positioning attributes.  |
+| Entry | Description |
+|---|---|
+| `cg_reactant_list` | Allowed ordered combinations of CG reactant types. |
+| `smarts` | RDKit reaction SMARTS. Atom-map labels define atoms retained or modified by the reaction. |
+| `prod_idx` | Zero-based indices of products retained after the reaction. |
+| `prob` | Optional reaction probability used by workflows that require it. |
 
-* **Returns**:
-    * `aa_mol_h` *(Chem.Mol)*: A sanitized, hydrogen-saturated mutable RDKit molecule object containing global
-      topological connections.
-    * `aa_graph` *(nx.Graph)*: All-atom molecular metadata network tracking atomic attributes and standardized `res_id`
-      markers.
+#### Rigid bodies
 
----
-
-### 2.2 `embed_molecule`
-
-Orchestrates 3D spatial coordinate construction, translating abstract graph connections into physical Cartesian
-coordinates tied to the CG template layout.
-
-```python
-molecule, molecule_graph = embed_molecule(aa_mol_h, cg_mol, aa_graph, box=None, large=500, chunk_per_d=1)
+```json
+{
+    "SiO": {
+        "file": "POSS.pdb",
+        "mapping": {
+            "5": {
+                "atom_idx": [0, 32, 33],
+                "smarts": "[N:1]([H:2])[H:3]"
+            }
+        },
+        "body_idx": [0]
+    }
+}
 ```
 
-| Parameter         | Type         | Default    | Description                                                                                        |
-|:------------------|:-------------|:-----------|:---------------------------------------------------------------------------------------------------|
-| **`aa_mol_h`**    | `Chem.Mol`   | *Required* | High-fidelity full-atom RDKit topology object generated by the `topology_builder`.                 |
-| **`cg_mol`**      | `nx.Graph`   | *Required* | Coarse-grained network template providing reference anchor positions (`'x'`).                      |
-| **`aa_graph`**    | `nx.Graph`   | *Required* | Metadata network tracing synchronized atomic features and residue groupings.                       |
-| **`box`**         | `np.ndarray` | `None`     | Simulation bounding dimensions array `[Lx, Ly, Lz]`. Falls back to infinite boundaries if omitted. |
-| **`large`**       | `int`        | `500`      | Critical system-size boundary parameter separating standard global routes from fragment loops.     |
-| **`chunk_per_d`** | `int`        | `1`        | Spatial grid subdivision factor utilized during orientation alignment optimizations.               |
+| Entry | Description |
+|---|---|
+| `file` | PDB or SDF file containing the complete AA rigid template. |
+| `body_idx` | CG rigid-body IDs represented by this template. |
+| `mapping` | Mapping from a CG local node index to an AA reaction fragment. JSON object keys are strings such as `"5"`. |
+| `atom_idx` | Ordered zero-based atom indices in the rigid AA template. |
+| `smarts` | SMARTS describing the mapped AA fragment. Single-atom and multi-atom fragments are supported. |
 
-* **Returns**:
-    * `molecule` *(Chem.Mol)*: The finalized RDKit molecule object with the optimized 3D Conformer bound to its internal
-      structure.
-    * `molecule_graph` *(nx.Graph)*: The updated all-atom metadata graph containing high-performance NumPy position
-      tensors under node attribute `'x'`.
+Rigid systems require XML CG input because rigid-body IDs and mapped node coordinates are read from the XML topology.
 
----
+### 1.2 Reaction file
 
-## 3. Deep Dive: Embedding Workflows & Parameters
-
-The `embed_molecule` engine processes geometry reconstruction via three parallel structural modes depending on the
-system characteristics:
+The reaction file contains one Python-style tuple per line:
 
 ```text
-                  [ embed_molecule ]
-                          │
-         ┌────────────────┼────────────────┐
-         ▼                ▼                ▼
-   [ Mode 1: Rigid ]    [ Mode 2: Small ]  [ Mode 3: Large ]
-     is_rigid=True      Atoms <= large     Atoms > large
-         │                │                │
-         ▼                ▼                ▼
-    Rigid Aligner   Standard ETKDG   Fragment Solver
+('B-A', 0, 1)
+('A-A', 1, 8)
+('A-A', 8, 13)
 ```
 
-### 3.1 The Three Processing Modes
+The first item is a reaction name defined in `reaction_template`. The remaining items are CG node indices.
 
-#### Mode 1: Rigid Body Alignment (`is_rigid=True`)
+Both forms of ordering are chemically significant:
 
-* **Target**: Static, non-deformable molecular architectures (e.g., pristine rings, functionalized fullerenes).
-* **Mechanism**: Bypasses local fragment embedding entirely. Calculates the geometric center of gravity across global
-  atom residues based on `local2atoms`, aligns them via Principal Component Analysis (PCA) against target coarse-grained
-  coordinates under strict Periodic Boundary Conditions (PBC), and transforms the entire rigid assembly safely to its
-  destination.
+- Tuple lines are executed from top to bottom.
+- Node indices inside each tuple define the ordered reactants and must match an entry in `cg_reactant_list`.
 
-#### Mode 2: Standard Global ETKDG (`Atoms <= large`)
+Users must provide the correct reaction history when topology construction depends on reaction order. An incorrect line order or reactant-index order may prevent `topology_builder` from finding the required reaction site.
 
-* **Target**: Discrete molecules or small crosslinked clusters falling beneath the `large` threshold limits.
-* **Mechanism**: Drives RDKit's standard distance geometry algorithm to compute coordinates globally. The engine queries
-  monomer definitions for chiral indicators—toggling random coordinate seeds off if chiral attributes exist to smooth
-  geometric convergence pathways. Generated coordinates undergo local origin-centering before traveling to the global
-  orientation stitcher.
+When `reaction_file` is omitted, DoMD-Conf applies a deterministic BFS traversal as a fallback. BFS is intended to protect against missing input; it may not recover the correct history of complex crosslinked or reaction-order-dependent systems.
 
-#### Mode 3: Hierarchical Fragment Solver (`Atoms > large`)
+### 1.3 Output
 
-* **Target**: High-molecular-weight polymers, macroscopic crosslinked networks, and long-chain structures.
-* **Mechanism**: Large systems experience geometric convergence failures if embedded all at once. Mode 3 implements a
-  specialized multi-tier assembly workflow:
-    1. **Local Fragmentation**: Clips out individual residue structures along with overlapping immediate neighbor
-       environments to preserve connective link geometries.
-    2. **Frontier Surgery**: Locates cut-boundary aromatic junctions and safely demotes their aromatic statuses to
-       stable single bonds, avoiding `SanitizeMol` failures inside truncated rings.
-    3. **Chiral Self-Correction**: Checks post-embedding chiral matrices against reference properties; if an inversion
-       is caught, it flips the local tetrahedral properties and re-embeds to guarantee stereochemical fidelity.
-    4. **Orientation Optimization**: Centers fragments at the origin and applies an analytical solver to orient linkages
-       seamlessly before finalizing placement.
+The online service returns a ZIP archive containing the selected result.
 
-### 3.2 Deep Meaning of Strategic Tuning Parameters
+#### Topology Only
 
-* **`large` (The Architectural Watershed)**
-    * Represents the structural tipping point where global distance geometry calculations shift from an asset to a
-      computational liability. For configurations below this limit, a single-pass global ETKDG invocation is faster.
-      Beyond this value, fragment decomposition takes over, preventing mathematical convergence failures and local
-      steric tangles.
-* **`chunk_per_d` (Spatial Decomposition Matrix)**
-    * Governs the spatial domain decomposition settings passed to high-performance Numba optimization loops during
-      global orientation stitching. For long polymers or macroscopic dense networks, setting `chunk_per_d > 1` segments
-      coordinates into localized grid dimensions, relaxing orientation boundaries step-by-step to mitigate ring-spearing
-      anomalies or spatial overlaps.
+```text
+system.pkl
+```
 
----
-
-## 4. Workflow Usage Example
+`system.pkl` stores:
 
 ```python
-from domd_topology.topology_builder import topology_builder
-from embed_molecule import embed_molecule
-from misc.io.sdf import post_process_aa_mol
-from misc.logger import logger
+list[rdkit.Chem.Mol]
+```
 
-# Configure global execution parameters
-large_threshold = 500
-chunks_per_dimension = 1
-final_rdmols = []
+Each RDKit molecule contains the reconstructed AA topology. Coordinate embedding is not performed in this mode.
 
-# Loop through and backmap each coarse-grained entity systematically
-for i, cg_mol in enumerate(cg_mols):
-    logger.info(f"Processing structural backmapping for system molecule {i + 1}")
+#### SDF Mode
 
-    # 1. Reconstruct the All-Atom topological connection graph
-    aa_mol_h, aa_graph = topology_builder(
-        reactants_config=reactants_config,
-        reaction_template=reaction_template,
-        cg_mol=cg_mol
-    )
+```text
+system.sdf
+```
 
-    # 2. Compute 3D coordinate conformers based on CG target layouts
-    # The output aa_mol_h contains the conformer; aa_graph contains node 'x' attributes
-    aa_mol_h, aa_graph = embed_molecule(
-        molecule=aa_mol_h,
-        cg_molecule=cg_mol,
-        molecule_graph=aa_graph,
-        box=box_tensor,
-        large=large_threshold,
-        chunk_per_d=chunks_per_dimension
-    )
+The SDF contains the list of reconstructed RDKit molecules with AA conformers. Each molecule is stored as one SDF record, and consecutive records are separated by:
 
-    # 3. Post-process to inject file-level metadata (resname, res_id, box_tensor)
-    aa_mol_h = post_process_aa_mol(aa_mol_h, box_tensor)
-    final_rdmols.append(aa_mol_h)
+```text
+$$$$
+```
 
-    logger.info(f"Successfully compiled molecule {i + 1} / {len(cg_mols)}")
+## 2. Core API
+
+### 2.1 `parse_config`
+
+```python
+config = parse_config(user_config)
+```
+
+Parses the user configuration, reads the CG topology and molecular templates, separates the CG system into molecular graphs, and prepares the reaction lists.
+
+**Input**
+
+| Argument | Type | Description |
+|---|---|---|
+| `user_config` | `dict` | Dictionary loaded from `config.json`. |
+
+**Output**
+
+| Object | Type | Description |
+|---|---|---|
+| `config` | `Config` | Parsed configuration containing `reactant_config`, `reaction_template`, `rigid_config`, `cg_graphs`, `reaction_list`, `cg_sys`, and `box_tensor`. |
+
+### 2.2 `topology_builder`
+
+```python
+rdmol, aa_graph = topology_builder(
+    reactant_config,
+    reaction_template,
+    rigid_config,
+    cg_graph,
+    reactions
+)
+```
+
+Builds the AA topology of one CG molecule by applying its ordered reaction list.
+
+**Inputs**
+
+| Argument | Type | Description |
+|---|---|---|
+| `reactant_config` | `dict` | Parsed flexible reactant templates. |
+| `reaction_template` | `dict` | Parsed reaction SMARTS and CG reactant rules. |
+| `rigid_config` | `dict` | Parsed rigid AA templates; use `{}` when no rigid body is present. |
+| `cg_graph` | `networkx.Graph` | One molecular CG graph from `config.cg_graphs`. |
+| `reactions` | `list[tuple]` | Ordered reactions corresponding to `cg_graph`. |
+
+**Outputs**
+
+| Object | Type | Description |
+|---|---|---|
+| `rdmol` | `rdkit.Chem.Mol` | Reconstructed AA molecular topology. |
+| `aa_graph` | `networkx.Graph` | AA graph containing the atom-to-CG mapping and molecular metadata used during embedding. |
+
+### 2.3 `embed_molecules`
+
+```python
+embedded_mols = embed_molecules(rdmols, aa_graphs, config, chunk_per_d=1)
+```
+
+Generates and aligns AA conformers for a list of reconstructed molecules using the corresponding CG coordinates.
+
+**Inputs**
+
+| Argument | Type | Description |
+|---|---|---|
+| `rdmols` | `list[Chem.Mol]` | AA molecules returned by `topology_builder`. |
+| `aa_graphs` | `list[nx.Graph]` | AA graphs corresponding one-to-one with `rdmols`. |
+| `config` | `Config` | Parsed configuration containing `cg_graphs`, `rigid_config`, and `box_tensor`. |
+| `chunk_per_d` | `int` | Number of spatial subdivisions along each Cartesian dimension during chunk-based orientation optimization. Increasing it reduces the maximum local optimization size and memory demand for large connected systems, while adding decomposition overhead. Default: `1`. |
+
+**Output**
+
+| Object | Type | Description |
+|---|---|---|
+| `embedded_mols` | `list[Chem.Mol]` | Molecules with reconstructed AA conformers in the original list order. |
+
+## 3. Examples
+
+### 3.1 SPE network
+
+This example contains a flexible crosslinked polymer electrolyte network and separate small molecular or ionic components.
+
+```text
+spe_network.zip
+├── config.json
+├── cg_conf.xml
+├── reactions.txt
+└── run.py
+```
+
+#### `config.json`
+
+```json
+{
+    "cg_topology_file": "cg_conf.xml",
+    "reaction_file": "reactions.txt",
+    "reactant_config": {
+        "A": {"smiles": "C=CC(=O)O", "file": null},
+        "B": {"smiles": "OCCCC", "file": null},
+        "C": {"smiles": "OCCOCCOCCOCCO", "file": null},
+        "L": {"smiles": "[Li+]", "file": null},
+        "T": {"smiles": "C(F)(F)(F)S(=O)(=O)[N-]S(=O)(=O)C(F)(F)(F)", "file": null},
+        "S": {"smiles": "N#CCCC#N", "file": null}
+    },
+    "reaction_template": {
+        "A-A": {
+            "cg_reactant_list": [["A", "A"]],
+            "smarts": "[C:1]=[C:2]C(=O)O.[C:3]=CC(=O)O>>[C:1][C:2](C(=O)O)[C:3]=CC(=O)O",
+            "prod_idx": [0]
+        },
+        "B-A": {
+            "cg_reactant_list": [["A", "B"]],
+            "smarts": "C(=O)[#8H1:1].[#6:2][#8H1:3]>>C(=O)[#8:3][#6:2].[#8:1]",
+            "prod_idx": [0]
+        },
+        "C-A": {
+            "cg_reactant_list": [["A", "C"]],
+            "smarts": "C(=O)[#8H1:1].[#6:2][#8H1:3]>>C(=O)[#8:1][#6:2].[#8:3]",
+            "prod_idx": [0]
+        },
+        "S": {
+            "cg_reactant_list": [["L"], ["T"], ["S"]],
+            "smarts": "*>>*",
+            "prod_idx": [0]
+        }
+    },
+    "rigid_config": {}
+}
+```
+
+#### `reactions.txt` excerpt
+
+The full file preserves the reaction sequence recorded during CG construction. A shortened excerpt is shown below:
+
+```text
+('B-A', 0, 1)
+('B-A', 2, 3)
+('C-A', 200, 201)
+('A-A', 676, 1896)
+('A-A', 1896, 1320)
+```
+
+#### `run.py`
+
+```python
+import json
+
+from embed_molecule import embed_molecules
+from misc.io.sdf import write_mols_to_sdf
+from misc.parser import parse_config
+from pipeline import topology_builder
+
+user_config = json.load(open('config.json', 'r'))
+config = parse_config(user_config)
+rdmols, aa_graphs = [], []
+
+for cg_graph, reactions in zip(config.cg_graphs, config.reaction_list):
+    rdmol, aa_graph = topology_builder(config.reactant_config, config.reaction_template,
+                                       config.rigid_config, cg_graph, reactions)
+    rdmols.append(rdmol)
+    aa_graphs.append(aa_graph)
+
+rdmols = embed_molecules(rdmols, aa_graphs, config, chunk_per_d=1)
+write_mols_to_sdf(rdmols, 'spe_network.sdf', force_v3000=True)
+```
+
+### 3.2 POSS-grafted polymer
+
+This example contains one POSS rigid body with four mapped amine reaction sites and four grafted PMMA chains. Its simple reaction tree is inferred by the BFS fallback, so no reaction file is required.
+
+```text
+poss_graft.zip
+├── config.json
+├── cg_conf.xml
+├── POSS.pdb
+└── run.py
+```
+
+#### `config.json`
+
+```json
+{
+    "cg_topology_file": "cg_conf.xml",
+    "reaction_template": {
+        "P-P": {
+            "cg_reactant_list": [["P", "P"]],
+            "smarts": "[C:1][CH1:2].[CH3:3]>>[C:1][C:2][C:3]",
+            "prod_idx": [0]
+        },
+        "CN-A": {
+            "cg_reactant_list": [["CN", "A"]],
+            "smarts": "[N:1][H:5].[OH1:2][C:3]=[O:4]>>[N:1][C:3]=[O:4].[O:2][H:5]",
+            "prod_idx": [0]
+        },
+        "A-P": {
+            "cg_reactant_list": [["A", "P"]],
+            "smarts": "[CH2:1][CH1:2].[CH3:3]>>[C:1][C:2][C:3]",
+            "prod_idx": [0]
+        }
+    },
+    "reactant_config": {
+        "P": {"smiles": "CC(C(=O)OC)C"},
+        "A": {"smiles": "OC(=O)CC(C(=O)OC)C"},
+        "CN": {"smiles": "[N:1]([H:2])[H:3]"}
+    },
+    "rigid_config": {
+        "SiO": {
+            "file": "POSS.pdb",
+            "mapping": {
+                "5": {"atom_idx": [0, 32, 33], "smarts": "[N:1]([H:2])[H:3]"},
+                "6": {"atom_idx": [23, 38, 39], "smarts": "[N:1]([H:2])[H:3]"},
+                "7": {"atom_idx": [28, 51, 52], "smarts": "[N:1]([H:2])[H:3]"},
+                "8": {"atom_idx": [31, 58, 59], "smarts": "[N:1]([H:2])[H:3]"}
+            },
+            "body_idx": [0]
+        }
+    }
+}
+```
+
+#### `run.py`
+
+```python
+import json
+
+from embed_molecule import embed_molecules
+from misc.io.sdf import write_mols_to_sdf
+from misc.parser import parse_config
+from pipeline import topology_builder
+
+user_config = json.load(open('config.json', 'r'))
+config = parse_config(user_config)
+rdmols, aa_graphs = [], []
+
+for cg_graph, reactions in zip(config.cg_graphs, config.reaction_list):
+    rdmol, aa_graph = topology_builder(config.reactant_config, config.reaction_template,
+                                       config.rigid_config, cg_graph, reactions)
+    rdmols.append(rdmol)
+    aa_graphs.append(aa_graph)
+
+rdmols = embed_molecules(rdmols, aa_graphs, config, chunk_per_d=1)
+write_mols_to_sdf(rdmols, 'POSS-g-PMMA.sdf', force_v3000=True)
 ```

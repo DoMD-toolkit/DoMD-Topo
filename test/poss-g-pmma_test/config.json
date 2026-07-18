@@ -1,0 +1,96 @@
+{
+	"cg_topology_file": "cg_conf.xml",
+    "reaction_template": {
+        "P-P": {
+            "cg_reactant_list": [
+                [
+                    "P",
+                    "P"
+                ]
+            ],
+            "smarts": "[C:1][CH1:2].[CH3:3]>>[C:1][C:2][C:3]",
+            "prod_idx": [
+                0
+            ]
+        },
+        "CN-A": {
+            "cg_reactant_list": [
+                [
+                    "CN",
+                    "A"
+                ]
+            ],
+            "smarts": "[N:1][H:5].[OH1:2][C:3]=[O:4]>>[N:1][C:3]=[O:4].[O:2][H:5]",
+            "prod_idx": [
+                0
+            ]
+        },
+        "A-P": {
+            "cg_reactant_list": [
+                [
+                    "A",
+                    "P"
+                ]
+            ],
+            "smarts": "[CH2:1][CH1:2].[CH3:3]>>[C:1][C:2][C:3]",
+            "prod_idx": [
+                0
+            ]
+			
+
+        }
+    },
+    "reactant_config": {
+        "P": {
+            "smiles": "CC(C(=O)OC)C"
+        },
+        "A": {
+            "smiles": "OC(=O)CC(C(=O)OC)C"
+        },
+        "CN": {
+            "smiles": "[N:1]([H:2])[H:3]"
+        }
+    },
+    "rigid_config": {
+        "SiO": {
+            "file": "POSS.pdb",
+            "mapping": {
+                "5": {
+                    "atom_idx": [
+                        0,
+                        32,
+                        33
+                    ],
+                    "smarts": "[N:1]([H:2])[H:3]"
+                },
+                "6": {
+                    "atom_idx": [
+                        23,
+                        38,
+                        39
+                    ],
+                    "smarts": "[N:1]([H:2])[H:3]"
+                },
+                "7": {
+                    "atom_idx": [
+                        28,
+                        51,
+                        52
+                    ],
+                    "smarts": "[N:1]([H:2])[H:3]"
+                },
+                "8": {
+                    "atom_idx": [
+                        31,
+                        58,
+                        59
+                    ],
+                    "smarts": "[N:1]([H:2])[H:3]"
+                }
+            },
+            "body_idx": [
+                0
+            ]
+        }
+    }
+}

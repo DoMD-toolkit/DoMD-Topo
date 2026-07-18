@@ -18,7 +18,7 @@ def write_mols_to_sdf(mols, output_path, force_v3000=True):
     if force_v3000:
         writer.SetForceV3000(True)
 
-    for idx, mol in tqdm.tqdm(enumerate(mols), total=len(mols), desc='writing molecules to SDF', disable=False):
+    for idx, mol in tqdm.tqdm(enumerate(mols), total=len(mols), desc='writing molecules to SDF', disable=True):
         if mol is None:
             continue
         # SDWriter automatically reads and writes all tags set via mol.SetProp()

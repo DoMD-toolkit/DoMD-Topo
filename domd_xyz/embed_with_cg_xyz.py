@@ -1,461 +1,383 @@
-from typing import Any, Dict, List, Tuple, Set
+import time
+from typing import Dict
 
 import networkx as nx
-import numba as nb
-from rdkit import Chem
-from rdkit.Chem import AllChem
-from scipy.stats import circmean
-
-from ..misc.logger import logger
-
-
-@nb.jit(nopython=True)
-def pbc(x, l):
-    """Applies periodic boundary conditions to a coordinate or vector.
-
-        Args:
-            x (float or np.ndarray): Input coordinate.
-            l (float or np.ndarray): Box length(s).
-
-        Returns:
-            float or np.ndarray: The wrapped coordinate within [-l/2, l/2].
-    """
-    return x - l * np.rint(x / l)
-
-
-def __get_best_alignment(coords_A, coords_B, box):
-    """Aligns point cloud B (mobile, e.g., AA) to reference point cloud A (target, e.g., CG)
-    without requiring point-to-point correspondence. Resolves axis sign ambiguity
-    using third-order moments (skewness).
-
-    Args:
-        coords_A (np.ndarray): Target reference coordinates, shape (D, 3).
-        coords_B (np.ndarray): Mobile initial coordinates, shape (N, 3).
-        box (np.ndarray): Simulation box dimensions.
-    """
-    D_dim = coords_A.shape[1]
-
-    # 1. Centering via circular mean under PBC
-    comA = np.array(
-        [circmean(coords_A[:, i:i + 1], low=-box[i] / 2., high=box[i] / 2., axis=0) for i in range(D_dim)]).ravel()
-    comB = np.array(
-        [circmean(coords_B[:, i:i + 1], low=-box[i] / 2., high=box[i] / 2., axis=0) for i in range(D_dim)]).ravel()
-
-    cA = pbc(coords_A - comA, box)
-    cB = pbc(coords_B - comB, box)
-
-    # 2. Compute 3x3 Gyration Tensors independently
-    RgA = np.dot(cA.T, cA) / len(cA)
-    RgB = np.dot(cB.T, cB) / len(cB)
-
-    def get_sorted_eigenvectors(rg_tensor):
-        vals, vecs = np.linalg.eigh(rg_tensor)
-        idx = np.argsort(vals)[::-1]  # Sort descending (largest inertia axis first)
-        return vecs[:, idx]
-
-    VA = get_sorted_eigenvectors(RgA)
-    VB = get_sorted_eigenvectors(RgB)
-
-    # 3. Project point clouds onto their respective principal axes
-    proj_A = cA @ VA  # Shape (D, 3)
-    proj_B = cB @ VB  # Shape (N, 3)
-
-    # Compute third moments (skewness signs) along each principal axis
-    skew_A = np.mean(proj_A ** 3, axis=0)
-    skew_B = np.mean(proj_B ** 3, axis=0)
-
-    # 4. Resolve sign ambiguities by aligning skewness directions
-    signs = np.ones(3)
-    for i in range(3):
-        if abs(skew_A[i]) > 1e-4 and abs(skew_B[i]) > 1e-4:
-            signs[i] = np.sign(skew_A[i]) * np.sign(skew_B[i])
-
-    # 5. Guard Clause: Enforce a proper rotation matrix (det == 1, no reflections)
-    R = VA @ np.diag(signs) @ VB.T
-    if np.linalg.det(R) < 0:
-        # If it's a reflection, flip the least significant axis (the thinnest direction)
-        signs[2] = -signs[2]
-        R = VA @ np.diag(signs) @ VB.T
-
-    return R, comA
-
-
 import numpy as np
+from rdkit import Chem
+from scipy.spatial.transform import Rotation
+
+from domd_xyz.optimize_orient import optimize_orient
+from misc.logger import logger
 
 
-def get_best_alignment(coords_A, coords_B, box, paired_A=None, paired_B=None):
-    """
-    Advanced Dual-Mode Alignment Engine for ChemFAST.
-
-    Mode 1 (Supervised/Kabsch): If paired markers >= 4, solve exact point-to-point via SVD.
-    Mode 2 (Unsupervised/PCA): Fallback to Gyration Tensor PCA + Skewness when markers < 4.
-    """
-    D_dim = coords_A.shape[1]
-
-    # -----------------------------------------------------------------
-    # 🔥 Kabsch Algorithm for Exact Point-to-Point Alignment (Supervised Mode)
-    # -----------------------------------------------------------------
-    if paired_A is not None and paired_B is not None and len(paired_A) >= 4:
-        comA = np.array(
-            [circmean(paired_A[:, i:i + 1], low=-box[i] / 2., high=box[i] / 2., axis=0) for i in range(D_dim)]).ravel()
-        comB = np.array(
-            [circmean(paired_B[:, i:i + 1], low=-box[i] / 2., high=box[i] / 2., axis=0) for i in range(D_dim)]).ravel()
-        cpA = pbc(paired_A - comA, box)
-        cpB = pbc(paired_B - comB, box)
-
-        H = np.dot(cpB.T, cpA)
-
-        U, S, Vt = np.linalg.svd(H)
-
-        R = np.dot(Vt.T, U.T)
-        if np.linalg.det(R) < 0:
-            Vt[2, :] *= -1
-            R = np.dot(Vt.T, U.T)
-
-        return R, comA
-
-    # -----------------------------------------------------------------
-    #  Principle Component Analysis (PCA) + Skewness Fallback Alignment
-    # -----------------------------------------------------------------
-    else:
-        comA = np.array(
-            [circmean(coords_A[:, i:i + 1], low=-box[i] / 2., high=box[i] / 2., axis=0) for i in range(D_dim)]).ravel()
-        comB = np.array(
-            [circmean(coords_B[:, i:i + 1], low=-box[i] / 2., high=box[i] / 2., axis=0) for i in range(D_dim)]).ravel()
-
-        cA = pbc(coords_A - comA, box)
-        cB = pbc(coords_B - comB, box)
-        RgA = np.dot(cA.T, cA) / len(cA)
-        RgB = np.dot(cB.T, cB) / len(cB)
-
-        def get_sorted_eigenvectors(rg_tensor):
-            vals, vecs = np.linalg.eigh(rg_tensor)
-            idx = np.argsort(vals)[::-1]
-            return vecs[:, idx]
-
-        VA = get_sorted_eigenvectors(RgA)
-        VB = get_sorted_eigenvectors(RgB)
-
-        proj_A = cA @ VA
-        proj_B = cB @ VB
-
-        skew_A = np.mean(proj_A ** 3, axis=0)
-        skew_B = np.mean(proj_B ** 3, axis=0)
-
-        signs = np.ones(3)
-        for i in range(3):
-            if abs(skew_A[i]) > 1e-4 and abs(skew_B[i]) > 1e-4:
-                signs[i] = np.sign(skew_A[i]) * np.sign(skew_B[i])
-
-        R = VA @ np.diag(signs) @ VB.T
-        if np.linalg.det(R) < 0:
-            signs[2] = -signs[2]
-            R = VA @ np.diag(signs) @ VB.T
-
-        return R, comA
+def pbc(coordinates: np.ndarray, box: np.ndarray) -> np.ndarray:
+    """Wrap coordinates or displacement vectors into the primary orthorhombic box."""
+    return coordinates - box * np.rint(coordinates / box)
 
 
-def rotate_confs(pos, R, box, com_TP):
-    """Applies a rotation and translation to a set of coordinates under PBC.
-
-        Args:
-            pos (np.ndarray): Input coordinates (N, 3).
-            R (np.ndarray): Rotation matrix (3, 3).
-            box (np.ndarray): Box dimensions.
-            com_TP (np.ndarray): Target center of mass position (translation vector).
-
-        Returns:
-            np.ndarray: Transformed coordinates.
-    """
-    N, D = pos.shape
-    com = np.array([circmean(pos[:, i:i + 1], low=-box[i] / 2., high=box[i] / 2., axis=0) for i in range(D)]).ravel()
-    cA = pbc(pos - com, box)
-    r_cA = np.dot(cA, R.T)
-    return r_cA + com_TP
-
-
-def analyze_topology(molecule_graph: nx.Graph, cg_graph: nx.Graph) -> Tuple[Dict[Any, int], Dict[int, List[int]]]:
-    """
-    Topology Analyzer: Standardizes and bridges residue ID mappings between AA and CG graphs.
-
-    This manager resolves the mapping between 'global_res_id' (CG node key) and
-    'local_res_id' (0-indexed sequence used for internal matrix optimizations).
-    It injects the unified 'res_id' back into the molecule_graph.
-
-    Args:
-        molecule_graph (nx.Graph): All-atom molecular graph. Nodes must contain 'global_res_id'.
-        cg_graph (nx.Graph): Coarse-grained graph template.
-
-    Returns:
-        Tuple[Dict, Dict]:
-            - global2local: Maps global_res_id -> local_res_id
-            - local2atoms: Maps local_res_id -> List of atom indices within this residue
-    """
-    if cg_graph.graph['rigidity'] == 'RIGID':
-        # Step 1: Strict Validation - global_res_id is a mandatory prerequisite
-        for atom_id, data in molecule_graph.nodes(data=True):
-            if 'global_res_id' not in data:
-                raise KeyError(
-                    f"Mandatory attribute 'global_res_id' missing at atom node {atom_id}. "
-                    f"The topology analyzer cannot map atoms to their coarse-grained counterparts."
-                )
-        # Step 2: Direct Mapping - For rigid molecules, all atoms belong to a single residue
-        global2local = {next(iter(cg_graph.nodes)): 0}
-        local2atoms = {0: list(molecule_graph.nodes)}
-        # Inject the unified res_id back into the molecule_graph
-        for atom_id in molecule_graph.nodes:
-            molecule_graph.nodes[atom_id]['res_id'] = 0
-    else:
-        # Step 1: Strict Validation - global_res_id is a mandatory prerequisite
-        for atom_id, data in molecule_graph.nodes(data=True):
-            if 'global_res_id' not in data:
-                raise KeyError(
-                    f"Mandatory attribute 'global_res_id' missing at atom node {atom_id}. "
-                    f"The topology analyzer cannot map atoms to their coarse-grained counterparts."
-                )
-
-        global2local: Dict[Any, int] = {}
-        # Step 3: Fallback Logic - If no local tracking IDs were provided, build from scratch
-        logger.debug("No local_res_id detected. Generating 0-indexed local sequences from cg_graph.")
-        for idx, cg_node in enumerate(cg_graph.nodes):
-            global2local[cg_node] = idx
-
-        # Step 4: Back-propagate finalized information and compile outputs
-        # Synchronize cg_graph attributes
-        for cg_node in cg_graph.nodes:
-            cg_graph.nodes[cg_node]['local_res_id'] = global2local[cg_node]
-
-        # Initialize the atom accumulator dictionary
-        local2atoms: Dict[int, List[int]] = {local_id: [] for local_id in global2local.values()}
-        # Update molecule_graph and harvest atom lists
-        for atom_id, data in molecule_graph.nodes(data=True):
-            g_id = data['global_res_id']
-            if g_id < 0:
-                continue
-            local_id = global2local[g_id]
-            # Inject the standardized token back into the all-atom graph reference
-            data['res_id'] = local_id
-            local2atoms[local_id].append(atom_id)
-        logger.info(f"Topology analysis complete. Successfully mapped {len(global2local)} residues.")
-    return global2local, local2atoms
-
-
-def build_isolated_fragment(
+def split_and_center_coordinates(
         molecule: Chem.Mol,
+        coordinates: np.ndarray,
         molecule_graph: nx.Graph,
-        local2atoms: Dict[int, List[int]],
-        target_res_id: int,
-        neighbor_res_ids: List[int]
-) -> Tuple[Chem.RWMol, Dict[int, int]]:
-    """
-    Fragment & Frontier Repair Workshop: Safely extracts a local molecular subgraph
-    and repairs broken aromatic/conjugated systems at the cutting frontiers.
-
-    Args:
-        molecule (Chem.Mol): Full all-atom reference molecule.
-        molecule_graph (nx.Graph): All-atom molecular graph with synchronized 'res_id'.
-        local2atoms (Dict[int, List[int]]): Mapping of local_res_id -> atom indices.
-        target_res_id (int): The central local_res_id to be embedded.
-        neighbor_res_ids (List[int]): Immediate neighbor local_res_ids to preserve connection environments.
-
-    Returns:
-        Tuple[Chem.RWMol, Dict[int, int]]:
-            - fragment: A sanitized, mutable RDKit molecule ready for 3D embedding.
-            - global_to_frag_map: Mapping of global atom index -> local fragment atom index.
-    """
-    fragment = Chem.RWMol()
-    allowed_res_ids = [target_res_id] + neighbor_res_ids
-
-    global_to_frag_map: Dict[int, int] = {}
-    atom_count = 0
-    frontier_atoms: Set[int] = set()
-
-    # Step 1: Harvest and map all candidate atoms within the allowed residue neighborhood
-    for r_id in allowed_res_ids:
-        atom_ids = local2atoms.get(r_id)
-        for a_id in atom_ids:
-            atom = molecule.GetAtomWithIdx(a_id)
-            # Add a copy of the atom into the new editable fragment
-            frag_aid = fragment.AddAtom(atom)
-            global_to_frag_map[a_id] = frag_aid
-            atom_count += 1
-
-    # Step 2: Extract internal bonds and identify cutting frontiers
-    bonds_to_add = set()
-    for g_id in global_to_frag_map:
-        atom = molecule.GetAtomWithIdx(g_id)
-        for bond in atom.GetBonds():
-            u = bond.GetBeginAtomIdx()
-            v = bond.GetEndAtomIdx()
-
-            # If the bond extends outside our allowed local neighborhood, it's a broken frontier
-            if molecule_graph.nodes[u]['res_id'] not in allowed_res_ids or \
-                    molecule_graph.nodes[v]['res_id'] not in allowed_res_ids:
-                frontier_atoms.add(g_id)
-                continue
-
-            # Store unique internal bonds (ordered to avoid duplicate (u,v) vs (v,u))
-            bonds_to_add.add((min(u, v), max(u, v), bond.GetBondType()))
-
-    # Add the discovered internal bonds into the fragment
-    for u, v, b_type in bonds_to_add:
-        fragment.AddBond(global_to_frag_map[u], global_to_frag_map[v], b_type)
-
-    # Step 3: Map stereochemistry and double-bond geometry safely to the fragment
-    for u, v, _ in bonds_to_add:
-        orig_bond = molecule.GetBondBetweenAtoms(u, v)
-        frag_bond = fragment.GetBondBetweenAtoms(global_to_frag_map[u], global_to_frag_map[v])
-
-        frag_bond.SetBondDir(orig_bond.GetBondDir())
-        frag_bond.SetStereo(orig_bond.GetStereo())
-
-        # If it is a geometric double bond (E/Z), correctly map the tracking stereo-marker atoms
-        if orig_bond.GetStereo() in (Chem.BondStereo.STEREOZ, Chem.BondStereo.STEREOE):
-            orig_stereo_atoms = list(orig_bond.GetStereoAtoms())
-            frag_bond.SetStereoAtoms(
-                global_to_frag_map[orig_stereo_atoms[0]],
-                global_to_frag_map[orig_stereo_atoms[1]]
-            )
-
-    # Step 4: Chemical Surgery - Repair broken conjugate/aromatic systems at the frontiers
-    for g_id in frontier_atoms:
-        f_id = global_to_frag_map[g_id]
-        frontier_atom = fragment.GetAtomWithIdx(f_id)
-
-        # Demote the frontier atom's aromatic status since its original ring system is truncated
-        frontier_atom.SetIsAromatic(0)
-        if frontier_atom.IsInRing() and molecule.GetAtomWithIdx(g_id).GetIsAromatic():
-            # If the frontier atom was originally aromatic and is now truncated, degrade its ring status
-            frontier_atom.SetIsAromatic(1)
-
-        # Recursively stabilize the immediate neighbors of the frontier atom
-        for nb_atom in frontier_atom.GetNeighbors():
-            # If the neighbor is deeply embedded inside a complete ring, preserve its aromaticity
-            if nb_atom.GetIsAromatic() and nb_atom.IsInRing():
-                continue
-
-            # Otherwise, degrade its aromaticity and force the modified linkage into a stable SINGLE bond
-            nb_atom.SetIsAromatic(0)
-            f_bond = fragment.GetBondBetweenAtoms(f_id, nb_atom.GetIdx())
-            f_bond.SetBondType(Chem.rdchem.BondType.SINGLE)
-
-    # Step 5: Final Sanitize and Validation check
-    Chem.SanitizeMol(fragment, Chem.SanitizeFlags.SANITIZE_ADJUSTHS)
-    sanitize_status = Chem.SanitizeMol(fragment, catchErrors=True)
-
-    if sanitize_status is not Chem.rdmolops.SanitizeFlags.SANITIZE_NONE:
-        logger.warning(
-            f"Fragment sanitization flagged anomalies for residue {target_res_id}. "
-            f"Status: {sanitize_status}"
-        )
-    fragment_h = Chem.AddHs(fragment)
-    return fragment, global_to_frag_map
-
-
-def _embed_with_chirality_check(
-        fragment: Chem.RWMol,
-        global_molecule: Chem.Mol,
-        global_to_frag_map: Dict[int, int],
-        target_atom_ids: List[int],
-        target_res_id: int
-) -> Chem.Conformer:
-    """
-    Sub-Workshop D1: Embeds a fragment using ETKDG and actively detects/corrects
-    any inverted chiral centers caused by localized fragmentation.
-    """
-    fragment_h = AllChem.AddHs(fragment)
-
-    # Track global reference chiral configurations for the target residue atoms
-    chiral_reference = {}
-    for g_id in target_atom_ids:
-        f_id = global_to_frag_map[g_id]
-        chiral_reference[f_id] = global_molecule.GetAtomWithIdx(g_id).GetChiralTag()
-        fragment_h.GetAtomWithIdx(f_id).SetChiralTag(chiral_reference[f_id])
-
-    # Set neighbor scaling atoms to unspecified to allow free flexible embedding rotation
-    for atom in fragment_h.GetAtoms():
-        if atom.GetIdx() not in chiral_reference:
-            atom.SetChiralTag(Chem.rdchem.ChiralType.CHI_UNSPECIFIED)
-
-    # Initial ETKDG coordinates generation loop
-    conf_id = -1
-    attempts, max_attempts = 10000, 25000
-    while conf_id == -1 and attempts <= max_attempts:
-        conf_id = AllChem.EmbedMolecule(fragment_h, maxAttempts=attempts, useRandomCoords=False)
-        attempts += 5000
-
-    if conf_id == -1:
-        raise ValueError(f"ETKDG failed to generate standard conformer for fragment of residue {target_res_id}")
-
-    # Analyze post-embedding chiral signatures against global reference definitions
-    ref_centers = dict(AllChem.FindMolChiralCenters(global_molecule, includeUnassigned=False))
-    frag_centers = dict(AllChem.FindMolChiralCenters(fragment_h, includeUnassigned=False))
-
-    chiral_flip_needed = False
-    for g_id in target_atom_ids:
-        f_id = global_to_frag_map[g_id]
-        if f_id in frag_centers and g_id in ref_centers:
-            # If RDKit inverted the mirror symmetry during embedding, trigger a tag inversion
-            if frag_centers[f_id] != ref_centers[g_id]:
-                chiral_flip_needed = True
-                atom = fragment_h.GetAtomWithIdx(f_id)
-                tag = atom.GetChiralTag()
-                if tag == Chem.rdchem.ChiralType.CHI_TETRAHEDRAL_CCW:
-                    atom.SetChiralTag(Chem.rdchem.ChiralType.CHI_TETRAHEDRAL_CW)
-                elif tag == Chem.rdchem.ChiralType.CHI_TETRAHEDRAL_CW:
-                    atom.SetChiralTag(Chem.rdchem.ChiralType.CHI_TETRAHEDRAL_CCW)
-
-    # If inversion occurred, re-embed using the compensated tetrahedral configurations (Negative * Negative = Positive)
-    if chiral_flip_needed:
-        logger.info(f"Chiral inversion detected in residue {target_res_id}. Re-embedding with adjusted tags.")
-        AllChem.EmbedMolecule(fragment_h, maxAttempts=10000, useRandomCoords=False)
-
-    # Perform local forcefield minimization to clean up structural bond lengths
-    AllChem.MMFFOptimizeMolecule(fragment_h, maxIters=5000)
-    return fragment_h.GetConformer()
-
-
-def generate_local_fragment_coords(
-        molecule: Chem.Mol,
-        molecule_graph: nx.Graph,
-        local2atoms: Dict[int, List[int]],
-        target_res_id: int,
-        neighbor_res_ids: List[int]
+        cg_graph: nx.Graph
 ) -> Dict[int, np.ndarray]:
+    """Split a whole-molecule conformer into mass-centered flexible CG residues."""
+    coordinates = np.asarray(coordinates, dtype=float)
+    if coordinates.shape != (molecule.GetNumAtoms(), 3):
+        raise ValueError(
+            f"Expected coordinates with shape ({molecule.GetNumAtoms()}, 3), found {coordinates.shape}."
+        )
+    flexible_nodes = {node for node, data in cg_graph.nodes(data=True) if data['body_id'] == -1}
+    residue_atoms = {node: [] for node in flexible_nodes}
+    for atom_id, data in molecule_graph.nodes(data=True):
+        if data['body_id'] != -1:
+            continue
+        res_id = data['global_res_id']
+        if res_id not in residue_atoms:
+            raise KeyError(f"Flexible AA atom {atom_id} refers to unknown CG node {res_id}.")
+        residue_atoms[res_id].append(atom_id)
+    local_coordinates: Dict[int, np.ndarray] = {}
+    for res_id, atom_ids in residue_atoms.items():
+        if not atom_ids:
+            raise ValueError(f"Flexible CG node {res_id} has no AA atoms.")
+        masses = np.array([molecule.GetAtomWithIdx(atom_id).GetMass() for atom_id in atom_ids])
+        total_mass = masses.sum()
+        if total_mass <= 0:
+            raise ValueError(f"Residue {res_id} has zero total atomic mass.")
+        center = np.sum(coordinates[atom_ids] * masses[:, None], axis=0) / total_mass
+        for atom_id in atom_ids:
+            local_coordinates[atom_id] = coordinates[atom_id] - center
+    return local_coordinates
+
+
+def _prepare_rigid_bodies(
+        molecule: Chem.Mol,
+        molecule_graph: nx.Graph,
+        cg_graph: nx.Graph,
+        rigid_config: dict
+) -> dict:
+    """Prepare each rigid body once for both optimization and final placement.
+
+    A reacted rigid body may contain fewer atoms than its original template. Existing
+    AA atoms are therefore recovered from ``molecule_graph`` and mapped to centered
+    template coordinates through ``intra_mol_id``. The CG orientation is applied here
+    exactly once. The resulting coordinates are fixed local coordinates relative to
+    the rigid-body COM and can be reused without another rigid rotation.
     """
-    Sub-Workshop D2: Coordinates Generator. Extracts fragment, executes embedding,
-    and harvests origin-centered (0,0,0) local coordinates for the central residue.
+    rigid_nodes = {}
+    for node, data in cg_graph.nodes(data=True):
+        if data['body_id'] >= 0:
+            rigid_nodes.setdefault(data['body_id'], []).append(node)
+    rigid_bodies = {}
+    for body_id in sorted(rigid_nodes):
+        body_nodes = rigid_nodes[body_id]
+        retained_nodes = [node for node in body_nodes if not cg_graph.nodes[node]['mapping_node']]
+        if len(retained_nodes) != 1:
+            raise ValueError(
+                f"Rigid body {body_id} must contain exactly one retained node; found {len(retained_nodes)}."
+            )
+        retained_data = cg_graph.nodes[retained_nodes[0]]
+        rigid_name = retained_data['rigid_name']
+        template_positions = rigid_config.get(rigid_name, {}).get('pos')
+        if template_positions is not None:
+            template_positions = np.asarray(template_positions, dtype=float)
+        atom_ids = [
+            atom_id for atom_id, data in molecule_graph.nodes(data=True)
+            if data['body_id'] == body_id
+        ]
+        if not atom_ids:
+            raise ValueError(f"No AA atoms remain for rigid body {body_id}.")
+        local_positions = []
+        for atom_id in atom_ids:
+            atom_data = molecule_graph.nodes[atom_id]
+            intra_mol_id = atom_data.get('intra_mol_id')
+            if intra_mol_id is None:
+                atom = molecule.GetAtomWithIdx(atom_id)
+                if atom.HasProp('intra_mol_id'):
+                    intra_mol_id = atom.GetIntProp('intra_mol_id')
+            if intra_mol_id is not None and template_positions is not None:
+                intra_mol_id = int(intra_mol_id)
+                if intra_mol_id < 0 or intra_mol_id >= len(template_positions):
+                    raise IndexError(
+                        f"intra_mol_id={intra_mol_id} for AA atom {atom_id} is outside rigid template {rigid_name}."
+                    )
+                local_positions.append(template_positions[intra_mol_id])
+            elif 'pos' in atom_data:
+                local_positions.append(np.asarray(atom_data['pos'], dtype=float))
+            else:
+                raise KeyError(
+                    f"Rigid AA atom {atom_id} requires intra_mol_id with rigid_config['{rigid_name}']['pos'], "
+                    "or a centered 'pos' attribute in aa_graph."
+                )
+        orientation = np.asarray(retained_data['orient'], dtype=float)
+        if orientation.shape != (3, 3):
+            raise ValueError(f"Rigid body {body_id} has orient shape {orientation.shape}; expected (3, 3).")
+        target_com = np.asarray(retained_data['x'], dtype=float)
+        rigid_bodies[body_id] = {
+            'atom_ids': np.asarray(atom_ids, dtype=np.int64),
+            'local_coords': Rotation.from_matrix(orientation).apply(np.asarray(local_positions, dtype=float)),
+            'com': target_com
+        }
+    return rigid_bodies
+
+
+def _build_orientation_system(
+        molecule: Chem.Mol,
+        flexible_coords: Dict[int, np.ndarray],
+        molecule_graph: nx.Graph,
+        cg_graph: nx.Graph,
+        rigid_bodies: dict
+) -> dict:
+    """Represent flexible residues and rigid bodies as uniform orientation units.
+
+    Each flexible CG node becomes one rotatable unit. Each complete rigid body becomes
+    one fixed unit, regardless of how many mapping nodes represent it in ``cg_graph``.
+    Atom indices and local coordinates are stored per unit so that a chunk can include
+    an entire rigid body without creating a second system-wide coordinate array.
     """
-    # 1. Delegate to Workshop C to safely clip the local subgraph
-    fragment, global_to_frag_map = build_isolated_fragment(
-        molecule, molecule_graph, local2atoms, target_res_id, neighbor_res_ids
+    flexible_nodes = [node for node, data in cg_graph.nodes(data=True) if data['body_id'] == -1]
+    node_to_unit = {node: unit for unit, node in enumerate(flexible_nodes)}
+    residue_atoms = {node: [] for node in flexible_nodes}
+    for atom_id, data in molecule_graph.nodes(data=True):
+        if data['body_id'] == -1:
+            res_id = data['global_res_id']
+            if res_id not in residue_atoms:
+                raise KeyError(f"Flexible AA atom {atom_id} refers to unknown CG node {res_id}.")
+            if atom_id not in flexible_coords:
+                raise KeyError(f"Local coordinate missing for flexible AA atom {atom_id}.")
+            residue_atoms[res_id].append(atom_id)
+    atom_unit = np.full(molecule.GetNumAtoms(), -1, dtype=np.int64)
+    unit_atoms, unit_local_coords, unit_com, unit_fixed = [], [], [], []
+    for node in flexible_nodes:
+        atom_ids = np.asarray(sorted(residue_atoms[node]), dtype=np.int64)
+        if len(atom_ids) == 0:
+            raise ValueError(f"Flexible CG node {node} has no AA atoms.")
+        unit = node_to_unit[node]
+        unit_atoms.append(atom_ids)
+        unit_local_coords.append(np.asarray([flexible_coords[i] for i in atom_ids], dtype=float))
+        unit_com.append(np.asarray(cg_graph.nodes[node]['x'], dtype=float))
+        unit_fixed.append(False)
+        atom_unit[atom_ids] = unit
+    for body_data in rigid_bodies.values():
+        unit = len(unit_atoms)
+        atom_ids = body_data['atom_ids']
+        unit_atoms.append(atom_ids)
+        unit_local_coords.append(body_data['local_coords'])
+        unit_com.append(body_data['com'])
+        unit_fixed.append(True)
+        atom_unit[atom_ids] = unit
+    missing = np.flatnonzero(atom_unit < 0)
+    if len(missing):
+        raise ValueError(f"AA atoms are not assigned to orientation units: {missing.tolist()}.")
+    unit_fixed = np.asarray(unit_fixed, dtype=bool)
+    neighbors = [set() for _ in unit_atoms]
+    pair_bonds = {}
+    for atom_u, atom_v in molecule_graph.edges:
+        unit_u, unit_v = int(atom_unit[atom_u]), int(atom_unit[atom_v])
+        if unit_u == unit_v or (unit_fixed[unit_u] and unit_fixed[unit_v]):
+            continue
+        pair = (min(unit_u, unit_v), max(unit_u, unit_v))
+        pair_bonds.setdefault(pair, []).append((atom_u, atom_v))
+        neighbors[unit_u].add(unit_v)
+        neighbors[unit_v].add(unit_u)
+    return {
+        'flexible_nodes': flexible_nodes, 'unit_atoms': unit_atoms,
+        'unit_local_coords': unit_local_coords,
+        'unit_com': np.asarray(unit_com, dtype=float).reshape(-1, 3),
+        'unit_fixed': unit_fixed, 'neighbors': neighbors, 'pair_bonds': pair_bonds
+    }
+
+
+def _build_chunk_plans(system: dict, box: np.ndarray, chunk_per_d: int, graph_radius: int):
+    """Create spatial core chunks and expand each core through the bonded unit graph.
+
+    Only flexible units define spatial cores because rigid units are never optimized.
+    Graph expansion adds the local bonded environment. Since one rigid body is stored
+    as one unit, reaching any of its reaction sites automatically includes the complete
+    reacted rigid body as a fixed boundary condition.
+    """
+    n_flexible = len(system['flexible_nodes'])
+    if not isinstance(chunk_per_d, (int, np.integer)) or chunk_per_d < 1:
+        raise ValueError("chunk_per_d must be a positive integer.")
+    if chunk_per_d == 1:
+        return [(np.arange(n_flexible, dtype=np.int64),
+                 np.arange(len(system['unit_atoms']), dtype=np.int64))]
+    if not isinstance(graph_radius, (int, np.integer)) or graph_radius < 1:
+        raise ValueError("graph_radius must be a positive integer.")
+    flexible_com = system['unit_com'][:n_flexible]
+    wrapped = np.mod(flexible_com + 0.5 * box, box)
+    cell_idx = np.floor(wrapped / (box / chunk_per_d)).astype(np.int64)
+    cell_idx = np.clip(cell_idx, 0, chunk_per_d - 1)
+    cell_units = {}
+    for unit, cell in enumerate(cell_idx):
+        cell_units.setdefault(tuple(cell), []).append(unit)
+    plans = []
+    for cell in sorted(cell_units):
+        core_units = np.asarray(cell_units[cell], dtype=np.int64)
+        expanded = set(core_units.tolist())
+        frontier = set(expanded)
+        for _ in range(graph_radius):
+            next_frontier = set()
+            for unit in frontier:
+                next_frontier.update(system['neighbors'][unit])
+            next_frontier.difference_update(expanded)
+            expanded.update(next_frontier)
+            frontier = next_frontier
+            if not frontier:
+                break
+        plans.append((core_units, np.asarray(sorted(expanded), dtype=np.int64)))
+    return plans
+
+
+def _selected_pairs(system: dict, selected_units: np.ndarray):
+    """Return bonded unit pairs fully contained in one expanded chunk."""
+    selected = set(selected_units.tolist())
+    return [(unit, neighbor) for unit in selected_units
+            for neighbor in system['neighbors'][unit]
+            if unit < neighbor and neighbor in selected]
+
+
+def _chunk_bond_count(system: dict, selected_units: np.ndarray) -> int:
+    """Count AA inter-unit bonds included in one expanded chunk."""
+    return sum(len(system['pair_bonds'][pair]) for pair in _selected_pairs(system, selected_units))
+
+
+def _assemble_chunk_input(system: dict, selected_units: np.ndarray):
+    """Build compact arrays accepted by ``optimize_orient`` for one chunk.
+
+    Global AA atom indices are remapped to a contiguous local range. Coordinates are
+    concatenated directly from the selected units, so only the active chunk is copied.
+    Rigid units retain all their existing atoms and are marked by ``is_fixed``.
+    """
+    unit_to_local = {unit: local for local, unit in enumerate(selected_units)}
+    atom_parts, coordinate_parts, mol_parts = [], [], []
+    for unit in selected_units:
+        atom_ids = system['unit_atoms'][unit]
+        atom_parts.append(atom_ids)
+        coordinate_parts.append(system['unit_local_coords'][unit])
+        mol_parts.append(np.full(len(atom_ids), unit_to_local[unit], dtype=np.int64))
+    chunk_atom_ids = np.concatenate(atom_parts)
+    local_coords = np.concatenate(coordinate_parts)
+    mol_idx = np.concatenate(mol_parts)
+    order = np.argsort(chunk_atom_ids)
+    chunk_atom_ids, local_coords, mol_idx = chunk_atom_ids[order], local_coords[order], mol_idx[order]
+    global_bonds = [bond for pair in _selected_pairs(system, selected_units)
+                    for bond in system['pair_bonds'][pair]]
+    if global_bonds:
+        bonds = np.searchsorted(chunk_atom_ids, np.asarray(global_bonds, dtype=np.int64))
+    else:
+        bonds = np.empty((0, 2), dtype=np.int64)
+    return (
+        local_coords, system['unit_com'][selected_units], bonds, mol_idx,
+        system['unit_fixed'][selected_units], unit_to_local
     )
 
-    # 2. Delegate to Sub-Workshop D1 to embed with accurate chirality controls
-    target_atom_ids = local2atoms[target_res_id]
-    frag_conf = _embed_with_chirality_check(
-        fragment, molecule, global_to_frag_map, target_atom_ids, target_res_id
+
+def _optimize_orientations(
+        system: dict,
+        box: np.ndarray,
+        chunk_per_d: int,
+        expand_radius: int
+) -> np.ndarray:
+    """Optimize unit rotations while keeping rigid bodies fixed.
+
+    Spatial chunks contain flexible core units and a bonded-graph halo. All flexible
+    units in the expanded chunk participate in optimization, but only core rotations
+    are retained. Rigid units provide already oriented boundary coordinates with
+    ``is_fixed=True``. The returned array covers every unit; rigid rotations remain I.
+    """
+    n_flexible = len(system['flexible_nodes'])
+    rotations = np.repeat(np.eye(3, dtype=float)[None, :, :], len(system['unit_atoms']), axis=0)
+    if n_flexible == 0:
+        return rotations
+    start = time.perf_counter()
+    plans = _build_chunk_plans(system, box, chunk_per_d, expand_radius)
+    n_bonds = sum(len(bonds) for bonds in system['pair_bonds'].values())
+    if n_bonds == 0:
+        logger.info("Orientation optimization skipped: no inter-residue bonds.")
+        return rotations
+    if chunk_per_d == 1:
+        logger.info(f"Orientation optimization: residues={n_flexible}, bonds={n_bonds}.")
+    else:
+        max_core = max(len(core) for core, _ in plans)
+        max_expanded = max(len(expanded) for _, expanded in plans)
+        max_bonds = max(_chunk_bond_count(system, expanded) for _, expanded in plans)
+        logger.info(f"Orientation optimization by chunks: residues={n_flexible}, bonds={n_bonds}, chunks={len(plans)}.")
+        logger.info(
+            f"Chunk decomposition: max nodes/chunk={max_core}, max expanded nodes/chunk={max_expanded}, max bonds/chunk={max_bonds}.")
+    n_optimized = 0
+    for chunk_number, (core_units, selected_units) in enumerate(plans, start=1):
+        local_coords, com, bonds, mol_idx, is_fixed, unit_to_local = _assemble_chunk_input(
+            system, selected_units
+        )
+        if chunk_per_d > 1:
+            logger.info(
+                f"Chunk {chunk_number}/{len(plans)} started: nodes={len(core_units)}, expanded nodes={len(selected_units)}, bonds={len(bonds)}.")
+        if len(bonds) == 0:
+            continue
+        local_rotations = optimize_orient(local_coords, com, box, bonds, mol_idx, is_fixed)
+        if not np.all(np.isfinite(local_rotations)):
+            logger.warning(
+                f"Chunk {chunk_number}/{len(plans)} failed: non-finite rotations; node orientations are unchanged.")
+            continue
+        for unit in core_units:
+            rotations[unit] = local_rotations[unit_to_local[unit]]
+        n_optimized += len(core_units)
+    gram = np.einsum('nij,nkj->nik', rotations, rotations)
+    orthogonality_error = np.max(np.linalg.norm(gram - np.eye(3), axis=(1, 2)))
+    determinant_error = np.max(np.abs(np.linalg.det(rotations) - 1.0))
+    elapsed = time.perf_counter() - start
+    logger.info(
+        f"Orientation optimization completed: optimized={n_optimized}, unchanged={n_flexible - n_optimized}, time={elapsed:.1f} s, orthogonality={orthogonality_error:.3e}, determinant={determinant_error:.3e}.")
+    return rotations
+
+
+def _place_orientation_units(system: dict, rotations: np.ndarray, final_coords: np.ndarray) -> None:
+    """Write flexible and rigid AA coordinates through one placement path.
+
+    Flexible units use the rotations returned by chunk optimization. Rigid local
+    coordinates already contain their CG orientation, and their stored rotation is I;
+    therefore this loop applies no second rigid rotation and only adds the rigid COM.
+    """
+    for unit, atom_ids in enumerate(system['unit_atoms']):
+        local_coords = system['unit_local_coords'][unit]
+        final_coords[atom_ids] = local_coords @ rotations[unit].T + system['unit_com'][unit]
+
+
+def align(
+        molecule: Chem.Mol,
+        flexible_coords: Dict[int, np.ndarray],
+        molecule_graph: nx.Graph,
+        cg_graph: nx.Graph,
+        rigid_config: dict,
+        box_tensor: np.ndarray,
+        chunk_per_d: int = 1,
+        expand_radius: int = 2
+) -> Chem.Conformer:
+    """Align all AA atoms through a shared flexible/rigid orientation-unit workflow.
+
+    Rigid template coordinates are oriented once during system preparation. Chunked
+    optimization then updates only flexible unit rotations, using complete rigid bodies
+    as fixed boundary conditions. A final shared placement step writes every AA atom.
+    """
+    box = np.asarray(box_tensor, dtype=float).reshape(-1)
+    if box.shape != (3,) or np.any(box <= 0):
+        raise ValueError(f"box_tensor must contain three positive box lengths; found {box_tensor}.")
+    expected_nodes = set(range(molecule.GetNumAtoms()))
+    if set(molecule_graph.nodes) != expected_nodes:
+        raise ValueError("aa_graph node IDs must match the RDKit atom indices 0..N-1.")
+    final_coords = np.full((molecule.GetNumAtoms(), 3), np.nan, dtype=float)
+    rigid_bodies = _prepare_rigid_bodies(molecule, molecule_graph, cg_graph, rigid_config or {})
+    system = _build_orientation_system(
+        molecule, flexible_coords or {}, molecule_graph, cg_graph, rigid_bodies
     )
-
-    # 3. Harvest raw absolute coordinates belonging strictly to the central target residue
-    local_coords: Dict[int, np.ndarray] = {}
-    com = np.zeros(3)
-    total_mass = 0.0
-
-    for g_id in target_atom_ids:
-        f_id = global_to_frag_map[g_id]
-        pos = frag_conf.GetAtomPosition(f_id)
-        pos_array = np.array([pos.x, pos.y, pos.z])
-
-        # Accumulate Center of Mass properties
-        mass = molecule.GetAtomWithIdx(g_id).GetMass()
-        com += pos_array * mass
-        total_mass += mass
-        local_coords[g_id] = pos_array
-
-    # 4. Zero-centering normalization pass: Force residue center of mass to (0, 0, 0)
-    com_vector = com / total_mass
-    for g_id in local_coords:
-        local_coords[g_id] -= com_vector
-
-    return local_coords
+    rotations = _optimize_orientations(system, box, chunk_per_d, expand_radius)
+    _place_orientation_units(system, rotations, final_coords)
+    missing = np.flatnonzero(~np.isfinite(final_coords).all(axis=1))
+    if len(missing):
+        raise ValueError(f"Coordinates were not assigned for AA atom indices {missing.tolist()}.")
+    final_coords = pbc(final_coords, box)
+    conformer = Chem.Conformer(molecule.GetNumAtoms())
+    for atom_id, coordinate in enumerate(final_coords):
+        conformer.SetAtomPosition(atom_id, coordinate)
+    return conformer

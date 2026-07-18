@@ -1,418 +1,352 @@
-from typing import Dict, List, Tuple
+from time import perf_counter
+from typing import Dict, List, Set, Tuple
 
 import networkx as nx
 import numpy as np
 from rdkit import Chem
-from rdkit.Chem import AllChem
+from rdkit.Chem import AllChem, rdMolHash
 
-from .embed_with_cg_xyz import (
-    generate_local_fragment_coords,
-    analyze_topology,
-    get_best_alignment,
-    rotate_confs,
-    pbc
-)
-from .optimize_orientation import Meta, optimize_res_orientation
-from ..misc.logger import logger
-from ..misc.parser import nxgraphs_to_mols
+from misc.logger import logger
 
 
-def assemble_and_stitch_system(
-        molecule: Chem.Mol,
-        molecule_graph: nx.Graph,
-        cg_graph: nx.Graph,
-        local2atoms: Dict[int, List[int]],
-        all_local_coords: Dict[int, np.ndarray],
-        box: np.ndarray,
-        chunks_per_d: int
-) -> Chem.Conformer:
+def build_isolated_fragment(molecule: Chem.Mol, local2atoms: Dict[int, List[int]],
+                            target_res_id: int, neighbor_res_ids: List[int]) -> Tuple[Chem.RWMol, Dict[int, int]]:
+    """Extract one residue and its neighbors while preserving global bond order.
+
+    RDKit tetrahedral tags are defined relative to the input order of an
+    atom's bonds. Atoms and bonds are therefore copied in global index order,
+    so an assigned ChiralTag keeps the same meaning in the fragment.
     """
-    Workshop E: Global Stitching Aligner. Solves orientation optimization matrices,
-    executes global 3D rotations/translations, and commits coordinates to a new conformer.
-    """
-    n_residues = len(local2atoms)
-    bonds = []
-    local_frame_idx = []
-
-    # 1. Parse inter-residue connecting bonds to construct topological linkers metadata
-    for u, v in molecule_graph.edges:
-        res_u = molecule_graph.nodes[u]['res_id']
-        res_v = molecule_graph.nodes[v]['res_id']
-
-        # Identify cross-boundary linkages spanning between different residues
-        if res_u != res_v:
-            bonds.append((res_u, res_v))
-            local_frame_idx.append((u, v))
-
-    # 2. Extract target mapping translation vectors from normalized CG template positions
-    trans = np.zeros((n_residues, 3))
-    for node in cg_graph.nodes:
-        local_res_id = cg_graph.nodes[node]['local_res_id']
-        trans[local_res_id] = cg_graph.nodes[node].get("x")
-
-    # 3. Flatten compiled atomic properties into arrays for Numba/SciPy performance loops
-    atom_pos_initial = np.zeros((molecule_graph.number_of_nodes(), 3))
-    atom_res_ids = np.zeros(molecule_graph.number_of_nodes(), dtype=np.int64)
-
-    for g_id, coord in all_local_coords.items():
-        atom_pos_initial[g_id] = coord
-        atom_res_ids[g_id] = molecule_graph.nodes[g_id]['res_id']
-
-    # 4. Initialize structural meta descriptors block
-    meta = Meta(
-        np.array(bonds, dtype=np.int64),
-        trans,
-        np.array(local_frame_idx, dtype=np.int64),
-        atom_pos_initial,
-        atom_res_ids,
-        box
+    total_start = perf_counter()
+    fragment = Chem.RWMol()
+    allowed_res_ids = [target_res_id] + neighbor_res_ids
+    global_to_frag_map: Dict[int, int] = {}
+    frontier_atoms: Set[int] = set()
+    atom_start = perf_counter()
+    fragment_atom_ids = sorted({atom_id for res_id in allowed_res_ids for atom_id in local2atoms.get(res_id, [])})
+    for atom_id in fragment_atom_ids:
+        global_to_frag_map[atom_id] = fragment.AddAtom(molecule.GetAtomWithIdx(atom_id))
+    atom_time = perf_counter() - atom_start
+    bond_start = perf_counter()
+    bond_ids_to_add = set()
+    for atom_id in global_to_frag_map:
+        atom = molecule.GetAtomWithIdx(atom_id)
+        for bond in atom.GetBonds():
+            u, v = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+            if u not in global_to_frag_map or v not in global_to_frag_map:
+                frontier_atoms.add(atom_id)
+                continue
+            bond_ids_to_add.add(bond.GetIdx())
+    for bond_id in sorted(bond_ids_to_add):
+        original_bond = molecule.GetBondWithIdx(bond_id)
+        u, v = original_bond.GetBeginAtomIdx(), original_bond.GetEndAtomIdx()
+        fragment.AddBond(global_to_frag_map[u], global_to_frag_map[v], original_bond.GetBondType())
+        fragment_bond = fragment.GetBondBetweenAtoms(global_to_frag_map[u], global_to_frag_map[v])
+        fragment_bond.SetBondDir(original_bond.GetBondDir())
+        fragment_bond.SetStereo(original_bond.GetStereo())
+        if original_bond.GetStereo() in (Chem.BondStereo.STEREOZ, Chem.BondStereo.STEREOE):
+            stereo_atoms = list(original_bond.GetStereoAtoms())
+            if len(stereo_atoms) == 2 and all(atom_id in global_to_frag_map for atom_id in stereo_atoms):
+                fragment_bond.SetStereoAtoms(global_to_frag_map[stereo_atoms[0]], global_to_frag_map[stereo_atoms[1]])
+    bond_time = perf_counter() - bond_start
+    frontier_start = perf_counter()
+    for atom_id in frontier_atoms:
+        fragment_atom = fragment.GetAtomWithIdx(global_to_frag_map[atom_id])
+        fragment_atom.SetIsAromatic(False)
+        if fragment_atom.IsInRing() and molecule.GetAtomWithIdx(atom_id).GetIsAromatic():
+            fragment_atom.SetIsAromatic(True)
+        for neighbor in fragment_atom.GetNeighbors():
+            if neighbor.GetIsAromatic() and neighbor.IsInRing():
+                continue
+            neighbor.SetIsAromatic(False)
+            fragment.GetBondBetweenAtoms(fragment_atom.GetIdx(), neighbor.GetIdx()).SetBondType(Chem.rdchem.BondType.SINGLE)
+    frontier_time = perf_counter() - frontier_start
+    adjust_h_start = perf_counter()
+    Chem.SanitizeMol(fragment, Chem.SanitizeFlags.SANITIZE_ADJUSTHS)
+    adjust_h_time = perf_counter() - adjust_h_start
+    sanitize_start = perf_counter()
+    sanitize_status = Chem.SanitizeMol(fragment, catchErrors=True)
+    sanitize_time = perf_counter() - sanitize_start
+    if sanitize_status != Chem.rdmolops.SanitizeFlags.SANITIZE_NONE:
+        logger.warning(f"Fragment sanitization reported status={sanitize_status} for residue {target_res_id}.")
+    logger.debug(
+        f"Fragment {target_res_id} construction timing: atoms={atom_time:.6f} s, "
+        f"bonds={bond_time:.6f} s, frontier={frontier_time:.6f} s, "
+        f"adjust_hs={adjust_h_time:.6f} s, sanitize={sanitize_time:.6f} s, "
+        f"total={perf_counter() - total_start:.6f} s."
     )
-
-    # 5. Invoke numerical solver to optimize rotational orientation matrices
-    logger.info("Optimize cross-cg-bead rotation matrix...")
-    rot = optimize_res_orientation(n_residues, meta, chunk_per_d=chunks_per_d)
-
-    # 6. Stitching Pass: Map final rigid transformation [Coord * Rot.T + Trans] under PBC limits
-    final_conformer = Chem.Conformer()
-    for local_res_id, atom_ids in local2atoms.items():
-        for g_id in atom_ids:
-            # Perform rigid matrix rotation based on optimized orientation directions
-            rotated_coord = rot[local_res_id].dot(all_local_coords[g_id])
-            # Translate directly to the matched Coarse-Grained space target coordinate
-            final_global_coord = rotated_coord + trans[local_res_id]
-
-            # Commit wrapped PBC position straight into the RDKit conformer storage
-            final_conformer.SetAtomPosition(g_id, pbc(final_global_coord, box))
-
-    return final_conformer
+    return fragment, global_to_frag_map
 
 
-def embed_rigid(molecule: Chem.Mol,
-                cg_molecule: nx.Graph,
-                box: np.ndarray) -> Chem.Mol:
+def _embed_with_chirality_check(fragment: Chem.RWMol, global_molecule: Chem.Mol,
+                                global_to_frag_map: Dict[int, int], target_atom_ids: List[int],
+                                target_res_id: int) -> Chem.Conformer:
+    """Embed a fragment using topology-defined chirality and verify its 3D geometry.
+
+    The global topology is the stereochemical reference. Assigned target-atom
+    ChiralTags are copied directly to the order-preserving fragment. Validation
+    is performed on a copy of the embedded fragment from its 3D conformer; no
+    global conformer or global CIP scan is required.
     """
-    Rigid Aligner Workshop: Rigidity-preserving alignment using unified topology metadata.
-
-    Calculates virtual geometric centers of all-atom residues based on 'local2atoms',
-    aligns them via PCA/RMSD optimization to target CG coordinates, and maps the
-    transformation globally across the rigid molecule.
-
-    Args:
-        molecule (Chem.Mol): All-atom RDKit molecule with an initial conformation.
-        cg_molecule (nx.Graph): Coarse-grained graph containing target coordinates 'x'.
-        box (np.ndarray): Simulation box dimensions for PBC wrapping.
-
-    Returns:
-        np.ndarray: The finalized, aligned 3D coordinates for all atoms.
-    """
-    # 1. Fetch the raw initial all-atom coordinates
-    conf = molecule.GetConformer(0)
-    aa_pos = conf.GetPositions()
-
-    cg_rigid_pos = []
-
-    # 2. Extract paired coordinates, strictly anchored by CG node order to guarantee alignment
-    for node in cg_molecule.nodes:
-        # Fetch target CG position
-        cg_rigid_pos.append(cg_molecule.nodes[node]['x'])
-    cg_rigid_pos = np.array(cg_rigid_pos)
-    # 3. Perform rigid-body optimization (Rotation & Translation search)
-    # get_best_alignment and rotate_confs remain identical to your mathematical primitives
-    body_id = cg_molecule.graph.get('body_id')[0]
-    pairs = cg_molecule.graph.get('rigid_pairs', {}).get(body_id)
-    if pairs is not None:
-        paired_A = pairs['paired_CG']
-        paired_B = pairs['paired_AA']
-    else:
-        paired_A, paired_B = None, None
-    best_R, target_com = get_best_alignment(cg_rigid_pos, aa_pos, box, paired_A=paired_A, paired_B=paired_B)
-
-    # 4. Apply transformation globally to all constituent atoms and wrap via PBC
-    transformed_aa_pos = rotate_confs(aa_pos, best_R, box, target_com)
-    conf = Chem.Conformer()
-    r_aa_pos = pbc(transformed_aa_pos, box)
-    for i, p in enumerate(r_aa_pos):
-        conf.SetAtomPosition(i, p)
-    # if molecule.GetNumConformers() == 0 and conf is not None:
-    #    molecule.AddConformer(conf, assignId=True)
-    return conf
-
-
-def embed_hybrid(
-        molecule: Chem.Mol,
-        molecule_graph: nx.Graph,
-        cg_graph: nx.Graph,
-        local2atoms: Dict[int, List[int]],
-        box: np.ndarray,
-        large: int = 500,
-        chunks_per_d: int = 1
-) -> Chem.Conformer:
-    """
-    Specialized Hybrid Solver. Extracts pre-aligned global coordinates for rigid bodies
-    from template layout files, constructs isolated pseudo-flexible topological graphs
-    for the remaining flexible chains plus their junction anchors, and runs analytical
-    stitching optimization.
-    """
-    logger.info("Executing specialized hybrid anchor-and-grow embedding workflow.")
-    all_local_coords: Dict[int, np.ndarray] = {}
-
-    # -----------------------------------------------------------------
-    # Rigid Pre-alignment
-    # -----------------------------------------------------------------
-    rigid_groups = cg_graph.graph.get('rigid_groups', {})
-    rigid_transforms: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
-    rigid_files = cg_graph.graph.get('rigid_files', {})
-    aa_rigid_groups = molecule_graph.graph.get('rigid_groups', {})
-
-    if not aa_rigid_groups:
-        for i in molecule_graph.nodes:
-            body_id = molecule_graph.nodes[i].get('body', -1)
-            if body_id >= 0:
-                aa_rigid_groups.setdefault(body_id, set()).add(i)
-
-    if not aa_rigid_groups:
-        logger.error("No rigid groups detected in the all-atom molecular graph. Cannot proceed.")
-        raise ValueError("No rigid groups detected in the all-atom molecular graph.")
-
-    for body_id, cg_nodes in rigid_groups.items():
-        if body_id == -1:
-            continue
-
-        # get the target CG positions for the current rigid body
-        cg_rigid_pos = np.array([cg_graph.nodes[n]['x'] for n in sorted(cg_nodes)])
-
-        # get the corresponding original all-atom positions for the rigid body
-        aa_rigid_atoms_global = sorted(aa_rigid_groups[body_id])
-        aa_rigid_atoms_intra = np.arange(len(aa_rigid_atoms_global))
-        for global_id, intra_id in zip(aa_rigid_atoms_global, aa_rigid_atoms_intra):
-            molecule_graph.nodes[global_id]['intra_mol_id'] = int(intra_id)
-        raw_template_positions = np.array(
-            [molecule_graph.nodes[aa_id]['pos'] for aa_id in sorted(aa_rigid_atoms_intra)])
-
-        # get the global atom IDs for the current rigid body from the all-atom molecular graph
-        global_aa_ids = sorted(list(aa_rigid_groups.get(body_id, [])))
-
-        # refine the intra_mol_id for each atom in the rigid body based on the global atom IDs
-        # the intra_mol_id may be changed compared to the original one in the template file, because the
-        # rigid body may react with other molecules and some atoms (e.g. H, H2O) may be removed,
-        # so we need to reassign the intra_mol_id based on the global atom IDs
-        for index, aa_id in enumerate(global_aa_ids):
-            if molecule_graph.nodes[aa_id].get('intra_mol_id') is None:
-                molecule_graph.nodes[aa_id]['intra_mol_id'] = index
-
-        aligned_aa_pos_list = []
-        for aa_id in global_aa_ids:
-            intra_atom_id = molecule_graph.nodes[aa_id]['intra_mol_id']
-            aligned_aa_pos_list.append(raw_template_positions[intra_atom_id])
-
-        aa_rigid_pos = np.array(aligned_aa_pos_list)
-
-        # use get_best_alignment to compute the optimal rotation via PCA-based alignment
-        # if there are paired atoms between CG and AA, use them to compute the optimal rotation via Kabsch algorithm
-        pairs = cg_graph.graph.get('rigid_pairs', {}).get(body_id)
-        if pairs is not None:
-            paired_A = pairs['paired_CG']
-            paired_B = pairs['paired_AA']
-        else:
-            paired_A, paired_B = None, None
-        best_R, target_com = get_best_alignment(cg_rigid_pos, aa_rigid_pos, box, paired_A=paired_A, paired_B=paired_B)
-        rigid_transforms[body_id] = (best_R, target_com)
-
-        # rotate and translate the rigid body atoms to the target CG positions
-        transformed_aa_pos = rotate_confs(aa_rigid_pos, best_R, box, target_com)
-        for idx, aa_id in enumerate(global_aa_ids):
-            all_local_coords[aa_id] = transformed_aa_pos[idx]
-
-    # -----------------------------------------------------------------
-    # Pseudo Graphs Construction
-    # -----------------------------------------------------------------
-    flex_cg_nodes = [n for n in cg_graph.nodes if cg_graph.nodes[n]['body'] == -1]
-    rigid_boundary_cg_nodes = set()
-
-    # Search for all rigid boundary CG beads that are bonded to flexible chains
-    for u, v in cg_graph.edges:
-        body_u = cg_graph.nodes[u]['body']
-        body_v = cg_graph.nodes[v]['body']
-        if body_u == -1 and body_v >= 0:
-            rigid_boundary_cg_nodes.add(v)
-        if body_v == -1 and body_u >= 0:
-            rigid_boundary_cg_nodes.add(u)
-
-    pseudo_cg_nodes = sorted(list(set(flex_cg_nodes).union(rigid_boundary_cg_nodes)))
-
-    # 2a. Construct a new coarse-grained pseudo graph `pseudo_cg_graph` that includes only flexible
-    # residues and the rigid boundary residues that connect to them.
-    pseudo_cg_graph = nx.Graph()
-    pseudo_cg_graph.graph['is_rigid'] = False
-    pseudo_cg_graph.graph['rigidity'] = 'FLEXIBLE'
-    pseudo_cg_graph.graph['box'] = box
-
-    old_cg2pseudo_res = {}
-    for pseudo_res_id, old_node in enumerate(pseudo_cg_nodes):
-        old_cg2pseudo_res[old_node] = pseudo_res_id
-        attrs = cg_graph.nodes[old_node].copy()
-        attrs['local_res_id'] = pseudo_res_id
-        pseudo_cg_graph.add_node(old_node, **attrs)
-
-    for u, v in cg_graph.edges:
-        if u in pseudo_cg_graph.nodes and v in pseudo_cg_graph.nodes:
-            pseudo_cg_graph.add_edge(u, v, **cg_graph.edges[u, v])
-
-    # 2b. Construct a new all-atom pseudo graph `pseudo_molecule_graph` that includes only flexible
-    # atoms and the rigid boundary atoms that connect to them.
-    pseudo_molecule_graph = nx.Graph()
-    old_aa2pseudo_aa = {}
-    pseudo_aa_idx = 0
-
-    for old_node in pseudo_cg_nodes:
-        orig_local_res_id = cg_graph.nodes[old_node]['local_res_id']
-        atom_ids = local2atoms[orig_local_res_id]
-        body_id = cg_graph.nodes[old_node]['body']
-        p_res_id = old_cg2pseudo_res[old_node]
-
-        if body_id >= 0:
-            junction_atoms = [aa_id for aa_id in atom_ids if any(
-                molecule_graph.nodes[nbr].get('body', -1) == -1 for nbr in molecule_graph.neighbors(aa_id))]
-            target_atoms = junction_atoms if junction_atoms else [atom_ids[0]]
-        else:
-            target_atoms = atom_ids
-
-        for aa_id in target_atoms:
-            old_aa2pseudo_aa[aa_id] = pseudo_aa_idx
-            attrs = molecule_graph.nodes[aa_id].copy()
-            attrs['res_id'] = p_res_id
-            pseudo_molecule_graph.add_node(pseudo_aa_idx, **attrs)
-            pseudo_aa_idx += 1
-
-    for u, v in molecule_graph.edges:
-        if u in old_aa2pseudo_aa and v in old_aa2pseudo_aa:
-            pseudo_molecule_graph.add_edge(old_aa2pseudo_aa[u], old_aa2pseudo_aa[v], **molecule_graph.edges[u, v])
-
-    # 2c. Re-invoke standard analyze_topology to generate a new local2atoms mapping for the pseudo graph system
-    _, pseudo_local2atoms = analyze_topology(pseudo_molecule_graph, pseudo_cg_graph)
-    pseudo_molecule = nxgraphs_to_mols([pseudo_molecule_graph])[0]
-    total_pseudo_atoms = pseudo_molecule.GetNumAtoms()
-
-    if total_pseudo_atoms <= large:
-        logger.info(
-            f"Flexible part in hybrid system ({total_pseudo_atoms} atoms) <= threshold. Invoking embed_by_etkdg.")
-        pseudo_conf = embed_by_etkdg(pseudo_molecule, pseudo_cg_graph, pseudo_molecule_graph, pseudo_local2atoms, box,
-                                     chunks_per_d)
-    else:
-        logger.info(
-            f"Flexible part in hybrid system ({total_pseudo_atoms} atoms) > threshold. Invoking embed_by_fragment.")
-        pseudo_conf = embed_by_fragment(pseudo_molecule, pseudo_molecule_graph, pseudo_cg_graph, pseudo_local2atoms,
-                                        box, chunks_per_d)
-
-    # -----------------------------------------------------------------
-    #  Assembly
-    # -----------------------------------------------------------------
-    for old_aa_id, p_aa_id in old_aa2pseudo_aa.items():
-        if molecule_graph.nodes[old_aa_id]['body_id'] == -1:
-            pos = pseudo_conf.GetAtomPosition(p_aa_id)
-            all_local_coords[old_aa_id] = np.array([pos.x, pos.y, pos.z])
-
-    final_full_conformer = Chem.Conformer()
-    for g_id, coord in all_local_coords.items():
-        final_full_conformer.SetAtomPosition(g_id, pbc(coord, box))
-
-    return final_full_conformer
-
-
-def embed_by_fragment(
-        molecule: Chem.Mol,
-        molecule_graph: nx.Graph,
-        cg_graph: nx.Graph,
-        local2atoms: Dict[int, List[int]],
-        box: np.ndarray,
-        chunks_per_d: int = 1
-) -> Chem.Conformer:
-    """
-    Specialized Fragment Solver. Only invoked for non-rigid, large macromolecular systems.
-    Orchestrates sequential fragment embedding and global spatial stitching.
-
-    Args:
-        molecule (Chem.Mol): All-atom RDKit molecule topology.
-        molecule_graph (nx.Graph): Global all-atom molecular network metadata.
-        cg_graph (nx.Graph): Coarse-grained graph configuration layout.
-        local2atoms (Dict[int, List[int]]): Standardized mapping of local_res_id -> atom indices.
-        box (np.ndarray): Simulation box bounds.
-        chunks_per_d (int, default 1): Spatial grid slicing factor for orientation optimization.
-
-    Returns:
-        Chem.Conformer: The finalized, fully stitched 3D conformer for the large system.
-    """
-    logger.info("Executing specialized fragment-based embedding workflow for large system.")
-    all_local_coords: Dict[int, np.ndarray] = {}
-    adj_dict = dict(cg_graph.adjacency())
-
-    # 1. Sequentially drive fragment generators across every coarse-grained residue node
-    for cg_node in cg_graph.nodes:
-        local_res_id = cg_graph.nodes[cg_node]['local_res_id']
-
-        # Discover neighboring residues mapped as CG node index keys
-        neighbor_cg_nodes = list(adj_dict[cg_node].keys())
-        neighbor_local_ids = [cg_graph.nodes[nb]['local_res_id'] for nb in neighbor_cg_nodes]
-
-        # Generate local zero-centered coordinates for this specific fragment block
-        residue_local_coords = generate_local_fragment_coords(
-            molecule, molecule_graph, local2atoms, local_res_id, neighbor_local_ids
-        )
-        all_local_coords.update(residue_local_coords)
-
-    # 2. Invoke Workshop E to optimize orientations and sew the fragments together in global space
-    final_conformer = assemble_and_stitch_system(
-        molecule, molecule_graph, cg_graph, local2atoms, all_local_coords, box, chunks_per_d
-    )
-    # if molecule.GetNumConformers() == 0 and conf is not None:
-    #    molecule.AddConformer(final_conformer, assignId=True)
-    return final_conformer
-
-
-def embed_by_etkdg(
-        molecule: Chem.Mol,
-        cg_molecule: nx.Graph,
-        molecule_graph: nx.Graph,
-        local2atoms: Dict[int, List[int]],
-        box: np.ndarray,
-        chunk_per_d: int = 1
-) -> Chem.Conformer:
-    """
-    Standard ETKDG Solver. Only invoked for non-rigid systems smaller than the 'large' threshold.
-    Generates initial global coordinates via ETKDG, then applies global alignment stitching.
-
-    Args:
-        molecule (Chem.Mol): All-atom RDKit molecule topology.
-        cg_molecule (nx.Graph): Coarse-grained graph template.
-        molecule_graph (nx.Graph): Global all-atom molecular network metadata.
-        local2atoms (Dict[int, List[int]]): Mapping of local_res_id -> atom indices.
-        box (np.ndarray): Simulation box bounds.
-        chunk_per_d (int, default 1): Spatial grid slicing factor for orientation optimization.
-
-    Returns:
-        Chem.Conformer: The finalized, aligned 3D conformer for the small system.
-    """
+    total_start = perf_counter()
+    add_h_start = perf_counter()
+    fragment_h = Chem.AddHs(fragment)
+    add_h_time = perf_counter() - add_h_start
+    setup_start = perf_counter()
+    chiral_reference = {}
+    target_fragment_ids = {global_to_frag_map[atom_id] for atom_id in target_atom_ids}
+    tetrahedral_tags = (Chem.rdchem.ChiralType.CHI_TETRAHEDRAL_CW,
+                        Chem.rdchem.ChiralType.CHI_TETRAHEDRAL_CCW)
+    boundary_chiral_centers = 0
+    for atom_id in target_atom_ids:
+        fragment_id = global_to_frag_map[atom_id]
+        global_atom = global_molecule.GetAtomWithIdx(atom_id)
+        chiral_tag = global_atom.GetChiralTag()
+        fragment_h.GetAtomWithIdx(fragment_id).SetChiralTag(chiral_tag)
+        if chiral_tag in tetrahedral_tags:
+            is_complete = all(neighbor.GetIdx() in global_to_frag_map for neighbor in global_atom.GetNeighbors())
+            if is_complete:
+                chiral_reference[fragment_id] = chiral_tag
+            else:
+                boundary_chiral_centers += 1
+    for atom in fragment_h.GetAtoms():
+        if atom.GetIdx() not in target_fragment_ids:
+            atom.SetChiralTag(Chem.rdchem.ChiralType.CHI_UNSPECIFIED)
+    setup_time = perf_counter() - setup_start
+    etkdg_start = perf_counter()
     conf_id = -1
-    attempts = 10000
-
-    # Determine if random coordinates are needed based on structural chiral centers
-    has_chiral = any(
-        len(AllChem.FindMolChiralCenters(Chem.AddHs(Chem.MolFromSmiles(cg_molecule.nodes[n]['smiles'])))) > 0
-        for n in cg_molecule.nodes
+    for attempts in range(10000, 25001, 5000):
+        conf_id = AllChem.EmbedMolecule(fragment_h, maxAttempts=attempts, useRandomCoords=False)
+        if conf_id != -1:
+            break
+    etkdg_time = perf_counter() - etkdg_start
+    if conf_id == -1:
+        raise ValueError(f"ETKDG failed for fragment of residue {target_res_id}.")
+    mmff_start = perf_counter()
+    AllChem.MMFFOptimizeMolecule(fragment_h, maxIters=5000)
+    mmff_time = perf_counter() - mmff_start
+    validation_start = perf_counter()
+    if chiral_reference:
+        check_molecule = Chem.Mol(fragment_h)
+        Chem.AssignAtomChiralTagsFromStructure(check_molecule, confId=conf_id, replaceExistingTags=True)
+        mismatched = [fragment_id for fragment_id, expected_tag in chiral_reference.items()
+                      if check_molecule.GetAtomWithIdx(fragment_id).GetChiralTag() != expected_tag]
+        if mismatched:
+            raise ValueError(f"3D chirality validation failed for residue {target_res_id}: fragment atoms={mismatched}.")
+    validation_time = perf_counter() - validation_start
+    logger.debug(
+        f"Fragment {target_res_id} embedding timing: add_hs={add_h_time:.6f} s, "
+        f"chiral_setup={setup_time:.6f} s, ETKDG={etkdg_time:.6f} s, "
+        f"MMFF={mmff_time:.6f} s, validated_chiral_centers={len(chiral_reference)}, "
+        f"boundary_chiral_centers={boundary_chiral_centers}, chirality_validation={validation_time:.6f} s, "
+        f"total={perf_counter() - total_start:.6f} s."
     )
-    use_random = not has_chiral
+    return fragment_h.GetConformer()
 
-    # Iterative global distance geometry embedding loop
-    while conf_id == -1:
-        conf_id = AllChem.EmbedMolecule(molecule, useRandomCoords=use_random, maxAttempts=attempts)
-        attempts += 5000
 
-    base_conf = molecule.GetConformer(conf_id)
-
-    # Normalize fragments at origin to match the global stitcher's protocol
-    all_local_coords = {a.GetIdx(): np.array(base_conf.GetAtomPosition(a.GetIdx())) for a in molecule.GetAtoms()}
-
-    # Pass through the global stitcher to correctly align and translate to CG positions
-    return assemble_and_stitch_system(
-        molecule, molecule_graph, cg_molecule, local2atoms, all_local_coords, box, chunk_per_d
+def _center_target_coords(molecule: Chem.Mol, target_atom_ids: List[int],
+                          target_coords: np.ndarray) -> Dict[int, np.ndarray]:
+    """Center target-residue coordinates at their mass-weighted center."""
+    total_start = perf_counter()
+    masses = np.asarray([molecule.GetAtomWithIdx(atom_id).GetMass() for atom_id in target_atom_ids], dtype=float)
+    total_mass = masses.sum()
+    if total_mass <= 0:
+        raise ValueError("Target residue has zero total atomic mass.")
+    centered = target_coords - np.sum(target_coords * masses[:, None], axis=0) / total_mass
+    result = {atom_id: centered[index].copy() for index, atom_id in enumerate(target_atom_ids)}
+    logger.debug(
+        f"Target coordinate centering timing: atoms={len(target_atom_ids)}, "
+        f"time={perf_counter() - total_start:.6f} s."
     )
+    return result
+
+
+def _map_cached_fragment_coords(fragment: Chem.Mol, target_fragment_ids: List[int],
+                                reference_fragment: Chem.Mol, reference_coords: np.ndarray,
+                                reference_target_ids: Tuple[int, ...]) -> np.ndarray | None:
+    """Map a cached complete fragment and return coordinates for the current target residue."""
+    total_start = perf_counter()
+    if fragment.GetNumAtoms() != reference_fragment.GetNumAtoms():
+        logger.debug(
+            f"Cached fragment mapping timing: result=atom_count_mismatch, "
+            f"time={perf_counter() - total_start:.6f} s."
+        )
+        return None
+    match_start = perf_counter()
+    match = fragment.GetSubstructMatch(reference_fragment, useChirality=True)
+    match_time = perf_counter() - match_start
+    if len(match) != reference_fragment.GetNumAtoms():
+        logger.debug(
+            f"Cached fragment mapping timing: result=substructure_mismatch, "
+            f"match={match_time:.6f} s, total={perf_counter() - total_start:.6f} s."
+        )
+        return None
+    if {match[index] for index in reference_target_ids} != set(target_fragment_ids):
+        logger.debug(
+            f"Cached fragment mapping timing: result=target_mismatch, "
+            f"match={match_time:.6f} s, total={perf_counter() - total_start:.6f} s."
+        )
+        return None
+    remap_start = perf_counter()
+    reference_by_current = {current_id: reference_id for reference_id, current_id in enumerate(match)}
+    mapped = np.asarray([reference_coords[reference_by_current[current_id]]
+                         for current_id in target_fragment_ids], dtype=float)
+    remap_time = perf_counter() - remap_start
+    logger.debug(
+        f"Cached fragment mapping timing: result=success, match={match_time:.6f} s, "
+        f"remap={remap_time:.6f} s, total={perf_counter() - total_start:.6f} s."
+    )
+    return mapped
+
+
+def generate_local_fragment_coords(molecule: Chem.Mol, molecule_graph: nx.Graph,
+                                   local2atoms: Dict[int, List[int]], target_res_id: int,
+                                   neighbor_res_ids: List[int], fragment_cache: dict = None,
+                                   cg_graph: nx.Graph = None) -> Dict[int, np.ndarray]:
+    """Embed one complete local fragment or reuse its cached conformer for the target residue."""
+    total_start = perf_counter()
+    build_start = perf_counter()
+    fragment, global_to_frag_map = build_isolated_fragment(molecule, local2atoms,
+                                                            target_res_id, neighbor_res_ids)
+    build_time = perf_counter() - build_start
+    target_atom_ids = local2atoms[target_res_id]
+    target_fragment_ids = [global_to_frag_map[atom_id] for atom_id in target_atom_ids]
+    target_type = cg_graph.nodes[target_res_id].get('type') if cg_graph is not None else None
+    hash_start = perf_counter()
+    cache_key = (rdMolHash.MolHash(fragment, rdMolHash.HashFunction.CanonicalSmiles), target_type)
+    hash_time = perf_counter() - hash_start
+    lookup_start = perf_counter()
+    if fragment_cache is not None and cache_key in fragment_cache:
+        reference_fragment, reference_coords, reference_target_ids = fragment_cache[cache_key]
+        mapping_start = perf_counter()
+        target_coords = _map_cached_fragment_coords(fragment, target_fragment_ids, reference_fragment,
+                                                    reference_coords, reference_target_ids)
+        mapping_time = perf_counter() - mapping_start
+        if target_coords is not None:
+            center_start = perf_counter()
+            result = _center_target_coords(molecule, target_atom_ids, target_coords)
+            center_time = perf_counter() - center_start
+            logger.debug(
+                f"Fragment {target_res_id} pipeline timing: cache=hit, build={build_time:.6f} s, "
+                f"hash={hash_time:.6f} s, lookup_and_mapping={perf_counter() - lookup_start:.6f} s, "
+                f"mapping={mapping_time:.6f} s, center={center_time:.6f} s, "
+                f"total={perf_counter() - total_start:.6f} s."
+            )
+            return result
+    lookup_time = perf_counter() - lookup_start
+    embed_start = perf_counter()
+    conformer = _embed_with_chirality_check(fragment, molecule, global_to_frag_map,
+                                            target_atom_ids, target_res_id)
+    embed_time = perf_counter() - embed_start
+    extraction_start = perf_counter()
+    fragment_coords = np.asarray(conformer.GetPositions(), dtype=float)[:fragment.GetNumAtoms()].copy()
+    if fragment_cache is not None:
+        fragment_cache[cache_key] = (Chem.Mol(fragment), fragment_coords.copy(), tuple(target_fragment_ids))
+    extraction_time = perf_counter() - extraction_start
+    center_start = perf_counter()
+    result = _center_target_coords(molecule, target_atom_ids, fragment_coords[target_fragment_ids])
+    center_time = perf_counter() - center_start
+    logger.debug(
+        f"Fragment {target_res_id} pipeline timing: cache=miss_or_mapping_failure, "
+        f"build={build_time:.6f} s, hash={hash_time:.6f} s, lookup={lookup_time:.6f} s, "
+        f"embed={embed_time:.6f} s, extraction_and_cache={extraction_time:.6f} s, "
+        f"center={center_time:.6f} s, total={perf_counter() - total_start:.6f} s."
+    )
+    return result
+
+
+def _flexible_atom_map(molecule_graph: nx.Graph, cg_graph: nx.Graph) -> Dict[int, List[int]]:
+    total_start = perf_counter()
+    flexible_nodes = {node for node, data in cg_graph.nodes(data=True) if data['body_id'] == -1}
+    local2atoms = {node: [] for node in flexible_nodes}
+    for atom_id, data in molecule_graph.nodes(data=True):
+        if data['body_id'] != -1:
+            continue
+        res_id = data['global_res_id']
+        if res_id not in local2atoms:
+            raise KeyError(f"Flexible AA atom {atom_id} refers to unknown CG node {res_id}.")
+        local2atoms[res_id].append(atom_id)
+    for atom_ids in local2atoms.values():
+        atom_ids.sort()
+    logger.debug(
+        f"Flexible atom mapping timing: residues={len(local2atoms)}, "
+        f"atoms={sum(len(atom_ids) for atom_ids in local2atoms.values())}, "
+        f"time={perf_counter() - total_start:.6f} s."
+    )
+    return local2atoms
+
+
+def generate_fragment_coordinates(molecule: Chem.Mol, molecule_graph: nx.Graph,
+                                  cg_graph: nx.Graph) -> Dict[int, np.ndarray]:
+    """Generate centered coordinates for every flexible CG residue by local ETKDG embedding."""
+    total_start = perf_counter()
+    atom_map_start = perf_counter()
+    local2atoms = _flexible_atom_map(molecule_graph, cg_graph)
+    atom_map_time = perf_counter() - atom_map_start
+    if not local2atoms:
+        logger.debug(
+            f"Fragment coordinate generation timing: residues=0, atom_mapping={atom_map_time:.6f} s, "
+            f"total={perf_counter() - total_start:.6f} s."
+        )
+        return {}
+    coordinates: Dict[int, np.ndarray] = {}
+    fragment_cache = {}
+    flexible_nodes = set(local2atoms)
+    report_interval = max(1, len(local2atoms) // 20)
+    loop_start = perf_counter()
+    for index, node in enumerate(local2atoms, start=1):
+        residue_start = perf_counter()
+        if not local2atoms[node]:
+            raise ValueError(f"Flexible CG node {node} has no AA atoms.")
+        neighbor_start = perf_counter()
+        neighbors = [neighbor for neighbor in cg_graph.neighbors(node) if neighbor in flexible_nodes]
+        neighbor_time = perf_counter() - neighbor_start
+        if index == 1 or index == len(local2atoms) or index % report_interval == 0:
+            logger.info(f"Fragment embedding {index}/{len(local2atoms)}: residue={node}, "
+                        f"atoms={len(local2atoms[node])}.")
+        generation_start = perf_counter()
+        coordinates.update(generate_local_fragment_coords(molecule, molecule_graph, local2atoms, node, neighbors,
+                                                           fragment_cache=fragment_cache, cg_graph=cg_graph))
+        generation_time = perf_counter() - generation_start
+        logger.debug(
+            f"Residue {node} fragment loop timing: neighbors={neighbor_time:.6f} s, "
+            f"generation={generation_time:.6f} s, total={perf_counter() - residue_start:.6f} s."
+        )
+    loop_time = perf_counter() - loop_start
+    logger.info(f"Fragment embedding completed: residues={len(local2atoms)}, "
+                f"cached environments={len(fragment_cache)}.")
+    logger.info(
+        f"Fragment coordinate generation timing: atom_mapping={atom_map_time:.6f} s, "
+        f"residue_loop={loop_time:.6f} s, total={perf_counter() - total_start:.6f} s."
+    )
+    return coordinates
+
+
+def generate_whole_coordinates(molecule: Chem.Mol) -> np.ndarray:
+    """Generate one unaligned whole-molecule ETKDG conformer in the current atom order."""
+    total_start = perf_counter()
+    copy_start = perf_counter()
+    working_molecule = Chem.Mol(molecule)
+    working_molecule.RemoveAllConformers()
+    copy_time = perf_counter() - copy_start
+    chirality_start = perf_counter()
+    use_random_coords = not bool(Chem.FindMolChiralCenters(working_molecule, includeUnassigned=False))
+    chirality_time = perf_counter() - chirality_start
+    etkdg_start = perf_counter()
+    conf_id = -1
+    for attempts in range(10000, 25001, 5000):
+        conf_id = AllChem.EmbedMolecule(working_molecule, useRandomCoords=use_random_coords, maxAttempts=attempts)
+        if conf_id != -1:
+            break
+    etkdg_time = perf_counter() - etkdg_start
+    if conf_id == -1:
+        raise ValueError("ETKDG failed to generate a whole-molecule conformer.")
+    extraction_start = perf_counter()
+    coordinates = np.asarray(working_molecule.GetConformer(conf_id).GetPositions(), dtype=float).copy()
+    extraction_time = perf_counter() - extraction_start
+    logger.debug(
+        f"Whole-molecule embedding timing: atoms={molecule.GetNumAtoms()}, copy={copy_time:.6f} s, "
+        f"chirality={chirality_time:.6f} s, ETKDG={etkdg_time:.6f} s, "
+        f"extraction={extraction_time:.6f} s, total={perf_counter() - total_start:.6f} s."
+    )
+    return coordinates

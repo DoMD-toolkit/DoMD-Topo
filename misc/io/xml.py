@@ -1,9 +1,12 @@
 import re
 from io import StringIO
+from pathlib import Path
+from typing import Optional, Sequence
 from xml.etree import cElementTree
+from xml.sax.saxutils import escape
 
-import networkx as nx
 import numpy as np
+from rdkit import Chem
 
 
 def pbc(x, l):
@@ -116,102 +119,150 @@ class XmlParser(object):
                 self.data[element.tag] = np.genfromtxt(StringIO(element.text), dtype=None, encoding=None)
 
 
-template_cg = '''<?xml version ="1.0" encoding ="UTF-8" ?>
-<{program}_xml version="{version}">
-<configuration time_step="0" dimensions="3" natoms="{n_atoms:d}" >
-<box lx="{lx:.8f}" ly="{ly:.8f}" lz="{lz:.8f}" xy="{xy:8f}" xz="{xz:8f}" yz="{yz:8f}"/>
-<position num="{n_atoms:d}">
-{positions}</position>
-<type num="{n_atoms:d}">
-{types}</type>
-<image num="{n_atoms:d}">
-{images}</image>
-<body num="{n_atoms:d}">
-{bodys}</body>
-<opls_type num="{n_atoms:d}">
-{opls_type}</opls_type>
-<monomer_id num="{n_atoms:d}">
-{monomer_id}</monomer_id>
-<charge num="{n_atoms:d}">
-{charge}</charge>
-<mass num="{n_atoms:d}">
-{mass}</mass>
-<bond num="{n_bonds:d}">
-{bond}
-</bond>
-<angle num="{n_angles:d}">
-{angle}
-</angle>
-<dihedral num="{n_dihedrals:d}">
-{dihedral}
-</dihedral>
-<improper num="{n_impropers:d}">
-{improper}
-</improper>
-</configuration>
-</{program}_xml>'''
+def write_mols_to_xml(
+        mols: Sequence[Chem.Mol],
+        box: Sequence[float],
+        filename: str = 'chemfast.xml',
+        graphs: Optional[Sequence] = None,
+        program: str = 'galamost',
+        version: str = '1.3'
+) -> Path:
+    """Write AA RDKit molecules into one XML system.
 
+    Coordinates are read from RDKit conformers. Atom and bond metadata are read
+    from the corresponding graph when available; otherwise, element-based types
+    are generated.
 
-def XmlWriter(CG_systems, box, filename='chemfast', program='galamost', version='1.3'):
-    """Writes a Coarse-Grained (CG) system configuration to an XML file.
-
-    Generates a simulation input file for CG systems. It handles hyperedges for
-    angles and dihedrals, rigid bodies, and periodic boundary conditions (PBC).
-
-    Args:
-        CG_systems (list[nx.Graph]): A list of coarse-grained molecular graphs.
-            Graphs may contain `_hyperedges` attributes for angles and dihedrals.
-        box (tuple): Simulation box dimensions (lx, ly, lz).
-        filename (str, optional): Base name for the output file. Defaults to 'chemfast'.
-        program (str, optional): Target simulation software name tag. Defaults to 'galamost'.
-        version (str, optional): XML format version. Defaults to '1.3'.
+    Graph node indices must match RDKit atom indices.
     """
-    CG_system_graph = nx.compose_all(CG_systems)
-    n_atoms = len(CG_system_graph.nodes)
-    n_bonds = len(CG_system_graph.edges)
-    n_angles = 0  # len(CG_system_graph._hyperedges[3]) if CG_system_graph._hyperedges.get(3) else 0
-    n_dihedrals = 0  # len(CG_system_graph._hyperedges[4]) if CG_system_graph._hyperedges.get(4) else 0
-    mass = types = opls_type = positions = charge = monomer_id = body = image = ''
-    bond = angle = dihedral = improper = ''
-    for system in CG_systems:
-        for atom_graph in system.nodes:
-            mass += '1.0\n'
-            charge += f'{system.nodes[atom_graph].get("charge", 0)}\n'
-            monomer_id += f'{atom_graph}\n'
-            types += '%s\n' % system.nodes[atom_graph]['type']
-            pos = pbc(system.nodes[atom_graph]['x'], box)
-            positions += '%.6f %.6f %.6f\n' % (pos[0], pos[1], pos[2])  # in nm
-            body += '%d\n' % int(system.nodes[atom_graph].get('body', -1))
-            if system.nodes[atom_graph].get('image') is None:
-                image += '0 0 0\n'
-            else:
-                atom_image = system.nodes[atom_graph]['image']
-                image += '%d %d %d\n' % (atom_image[0], atom_image[1], atom_image[2])
-        n_angles_ = 0
-        angles = {}
-        n_angles += n_angles_
-        n_dihedrals_ = 0
-        dihedrals = {}
-        n_dihedrals += n_dihedrals_
-        for k in angles:
-            angle += f"{angles[k]['bt']} {k[0]} {k[1]} {k[2]}\n"
-        dihedral = ''
-        for k in dihedrals:
-            dihedral += (f"{dihedrals[k]['bond_type']} "
-                         f"{k[0]} {k[1]} {k[2]} {k[3]}\n")
-        for k in system.edges:
-            bond += f"{system.edges[k]['bond_type']} {k[0]} {k[1]}\n"
-    lx, ly, lz = box
-    xy, xz, yz = [0, 0, 0]
-    o = open('out_%s.xml' % filename, 'w')
-    o.write(
-        template_cg.format(
-            n_atoms=n_atoms, n_bonds=n_bonds, mass=mass, types=types, images=image, bodys=body, opls_type=opls_type,
-            positions=positions,
-            bond=bond, charge=charge, angle=angle, dihedral=dihedral, n_angles=n_angles, n_dihedrals=n_dihedrals,
-            monomer_id=monomer_id, program=program, version=version, lx=lx, ly=ly, lz=lz, xy=xy, xz=xz, yz=yz,
-            n_impropers=0, improper=improper
+    if graphs is not None and len(graphs) != len(mols):
+        raise ValueError("graphs and mols must contain the same number of molecules.")
+
+    box = np.asarray(box, dtype=float) * 0.1
+    if box.shape != (3,) or np.any(box <= 0):
+        raise ValueError(f"box must contain three positive lengths, found {box}.")
+
+    output_path = Path(filename)
+    if output_path.suffix.lower() != '.xml':
+        output_path = output_path.with_suffix('.xml')
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    atom_offsets = []
+    n_atoms = 0
+    n_bonds = 0
+    for mol in mols:
+        if mol.GetNumConformers() == 0:
+            raise ValueError("Every molecule must contain an RDKit conformer.")
+        atom_offsets.append(n_atoms)
+        n_atoms += mol.GetNumAtoms()
+        n_bonds += mol.GetNumBonds()
+
+    def atom_data(mol_idx, atom_idx):
+        atom = mols[mol_idx].GetAtomWithIdx(atom_idx)
+        data = graphs[mol_idx].nodes[atom_idx] if graphs is not None else {}
+        atom_type = str(data.get('type', atom.GetSymbol()))
+        return atom, data, atom_type
+
+    def iter_atoms():
+        for mol_idx, mol in enumerate(mols):
+            conf = mol.GetConformer()
+            offset = atom_offsets[mol_idx]
+            for atom_idx in range(mol.GetNumAtoms()):
+                atom, data, atom_type = atom_data(mol_idx, atom_idx)
+                yield mol_idx, atom_idx, offset + atom_idx, atom, data, atom_type, conf
+
+    def write_section(handle, name, count, lines):
+        handle.write(f'<{name} num="{count}">\n')
+        for line in lines:
+            handle.write(f'{line}\n')
+        handle.write(f'</{name}>\n')
+
+    def position_lines():
+        for _, atom_idx, _, _, _, _, conf in iter_atoms():
+            position = np.asarray(conf.GetAtomPosition(atom_idx), dtype=float) * 0.1
+            position -= box * np.floor(position / box + 0.5)
+            yield f'{position[0]:.8f} {position[1]:.8f} {position[2]:.8f}'
+
+    def type_lines():
+        for _, _, _, _, _, atom_type, _ in iter_atoms():
+            yield escape(atom_type)
+
+    def image_lines():
+        for _, _, _, _, data, _, _ in iter_atoms():
+            image = np.asarray(data.get('image', (0, 0, 0)), dtype=int)
+            if image.shape != (3,):
+                raise ValueError(f"Invalid image shape: {image.shape}.")
+            yield f'{image[0]} {image[1]} {image[2]}'
+
+    def body_lines():
+        for _, _, _, _, data, _, _ in iter_atoms():
+            yield str(int(data.get('body_id', -1)))
+
+    def opls_type_lines():
+        for _, _, _, _, data, atom_type, _ in iter_atoms():
+            yield escape(str(data.get('opls_type', atom_type)))
+
+    def monomer_id_lines():
+        for mol_idx, _, global_idx, _, data, _, _ in iter_atoms():
+            monomer_id = data.get(
+                'monomer_id',
+                data.get('global_res_id', data.get('res_id', mol_idx))
+            )
+            yield str(monomer_id)
+
+    def charge_lines():
+        for _, _, _, atom, data, _, _ in iter_atoms():
+            charge = data.get('charge', atom.GetFormalCharge())
+            yield f'{float(charge):.8g}'
+
+    def mass_lines():
+        for _, _, _, atom, data, _, _ in iter_atoms():
+            yield f'{float(data.get("mass", atom.GetMass())):.8g}'
+
+    def bond_lines():
+        for mol_idx, mol in enumerate(mols):
+            graph = graphs[mol_idx] if graphs is not None else None
+            offset = atom_offsets[mol_idx]
+            for bond in mol.GetBonds():
+                u = bond.GetBeginAtomIdx()
+                v = bond.GetEndAtomIdx()
+                _, _, type_u = atom_data(mol_idx, u)
+                _, _, type_v = atom_data(mol_idx, v)
+                default_type = '-'.join(sorted((type_u, type_v)))
+
+                if graph is not None and graph.has_edge(u, v):
+                    bond_type = graph.edges[u, v].get('bond_type', default_type)
+                else:
+                    bond_type = default_type
+
+                yield f'{escape(str(bond_type))} {offset + u} {offset + v}'
+
+    root = f'{program}_xml'
+    with output_path.open('w', encoding='utf-8', newline='\n') as handle:
+        handle.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+        handle.write(f'<{root} version="{escape(str(version))}">\n')
+        handle.write(
+            f'<configuration time_step="0" dimensions="3" natoms="{n_atoms}">\n'
         )
-    )
-    o.close()
-    return
+        handle.write(
+            f'<box lx="{box[0]:.8f}" ly="{box[1]:.8f}" lz="{box[2]:.8f}" '
+            f'xy="0.00000000" xz="0.00000000" yz="0.00000000"/>\n'
+        )
+
+        write_section(handle, 'position', n_atoms, position_lines())
+        write_section(handle, 'type', n_atoms, type_lines())
+        write_section(handle, 'image', n_atoms, image_lines())
+        write_section(handle, 'body', n_atoms, body_lines())
+        write_section(handle, 'opls_type', n_atoms, opls_type_lines())
+        write_section(handle, 'monomer_id', n_atoms, monomer_id_lines())
+        write_section(handle, 'charge', n_atoms, charge_lines())
+        write_section(handle, 'mass', n_atoms, mass_lines())
+        write_section(handle, 'bond', n_bonds, bond_lines())
+        write_section(handle, 'angle', 0, ())
+        write_section(handle, 'dihedral', 0, ())
+        write_section(handle, 'improper', 0, ())
+
+        handle.write('</configuration>\n')
+        handle.write(f'</{root}>\n')
+
+    return output_path

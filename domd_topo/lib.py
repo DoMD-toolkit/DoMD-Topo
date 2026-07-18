@@ -45,7 +45,7 @@ def set_molecule_id_for_h(molecule: Union[Chem.RWMol, Chem.Mol]) -> Union[Chem.R
         if atom.GetAtomicNum() != 1:
             for nbr_atom in atom.GetNeighbors():
                 if nbr_atom.GetAtomicNum() == 1:
-                    nbr_atom.SetIntProp("res_id", atom.GetIntProp("res_id"))
+                    nbr_atom.SetIntProp("local_res_id", atom.GetIntProp("local_res_id"))
                     nbr_atom.SetIntProp("global_res_id", atom.GetIntProp("global_res_id"))
                     nbr_atom.SetProp('res_name', atom.GetProp('res_name'))
     return molecule

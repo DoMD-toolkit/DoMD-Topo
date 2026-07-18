@@ -7,77 +7,49 @@ import torch
 from scipy.optimize import minimize
 from torch import optim
 
-from ..misc.logger import logger
+from misc.logger import logger
 
 
-def optimization_by_chunk(chunk_per_d, connections, pos, local_frame_idx, trans, box, rot):
-    """Splits the optimization problem into smaller chunks based on spatial locality.
-
-        This function divides the simulation box into a grid and assigns residues to cells.
-        It identifies bonded interactions that occur entirely within a cell (chunk) and
-        prepares the necessary metadata (indices, local mappings) to optimize these
-        chunks independently. This is useful for large systems where a global Hessian
-        is too expensive.
-
-
-
-        Args:
-            chunk_per_d (int): Number of chunks per dimension.
-            connections (np.ndarray): Array of shape (M, 2) containing residue indices for bonds.
-            pos (np.ndarray): Atom positions relative to residue center (N_atoms, 3).
-            local_frame_idx (np.ndarray): Array of shape (M, 2) containing local atom indices for each connection.
-            trans (np.ndarray): Translation vectors (CG bead positions) for each residue (N_res, 3).
-            box (np.ndarray): Simulation box dimensions.
-            rot (np.ndarray): Initial rotation matrices (flattened or shaped).
-
-        Returns:
-            tuple: A tuple containing:
-                - cid_set (set): Set of active cell IDs.
-                - cid_meta (dict): Metadata for each chunk (connections, indices, rotation subsets).
-                - cid_hash (dict): Mapping from cell ID to connection masks.
-    """
+def optimization_by_chunk(chunk_per_d, connections, pos, local_frame_idx, trans, box, rot, expand_radius=1):
+    """Build spatial chunks augmented by a bonded graph neighborhood."""
     rot = rot.reshape(-1, 3, 3)
+    shifted_trans = trans + 0.5 * box
     chunk_len = np.ceil(box / chunk_per_d)
-    pos = pos + 0.5 * box
-    trans = trans + 0.5 * box
-    # pos_cell_idx = pos//chunk_len
-    cgpos_cell_idx = trans // chunk_len
-    cell_idx_set = set([tuple(i) for i in cgpos_cell_idx])
-    idx_to_cid = {s: i for i, s in enumerate(cell_idx_set)}
-    cid_to_idx = {i: s for i, s in enumerate(cell_idx_set)}
-    rid_to_cid = {i: idx_to_cid[tuple(idx)] for i, idx in enumerate(cgpos_cell_idx)}
-    cgpos_cell_cid = np.array([rid_to_cid[i] for i in range(len(trans))])
-    cid_set = set(cgpos_cell_cid)
-    r1 = pos[local_frame_idx.T[0]]
-    r2 = pos[local_frame_idx.T[1]]
-    r1_cid = cgpos_cell_cid[connections.T[0]]
-    r2_cid = cgpos_cell_cid[connections.T[1]]
-    cid_hash = {}
+    cgpos_cell_idx = shifted_trans // chunk_len
+    cell_idx_set = sorted({tuple(idx) for idx in cgpos_cell_idx})
+    idx_to_cid = {idx: cid for cid, idx in enumerate(cell_idx_set)}
+    cgpos_cell_cid = np.array([idx_to_cid[tuple(idx)] for idx in cgpos_cell_idx], dtype=np.int64)
+    cid_set = np.unique(cgpos_cell_cid)
+    connection_u, connection_v = connections.T
+    cid_hash, cid_meta = {}, {}
     for cid in cid_set:
-        hash_ = (r1_cid == cid) + (r2_cid == cid)
-        cid_hash[cid] = hash_
-    # print(cid_hash)
-    cid_meta = {}
-    for cid in cid_hash:
-        hash_ = cid_hash[cid]
-        connections_ = connections[hash_]
-        in_chunk_res_idx = set()
-        for i, j in connections_:
-            in_chunk_res_idx.add(i)
-            in_chunk_res_idx.add(j)
-        in_chunk_res_idx = np.sort(list(in_chunk_res_idx))
-        # print(in_chunk_res_idx)
-        if len(in_chunk_res_idx) == 0:
-            in_chunk_res_idx = []
-            continue
-        local_to_global = {i: gid for i, gid in enumerate(in_chunk_res_idx)}  # if in_chunk_res_idx is not None else {}
-        global_to_local = {gid: i for i, gid in enumerate(in_chunk_res_idx)}  # if in_chunk_res_idx is not None else {}
-        in_chunk_connections = np.array([[global_to_local[i], global_to_local[j]] for i, j in connections_])
-        # print(rot.shape,print(rot[[]]))
-        cid_meta[cid] = {'connections_': in_chunk_connections, 'local_frame_idx': local_frame_idx[hash_],
-                         'n_residue': len(in_chunk_res_idx),
-                         'rot': rot[in_chunk_res_idx].ravel(), 'local_to_global': local_to_global,
-                         'connections': connections_}
+        chunk_res_idx = np.flatnonzero(cgpos_cell_cid == cid)
+        expanded_mask = np.zeros(len(trans), dtype=bool)
+        expanded_mask[chunk_res_idx] = True
+        for _ in range(expand_radius):
+            expansion_edge_mask = expanded_mask[connection_u] | expanded_mask[connection_v]
+            expanded_mask[connection_u[expansion_edge_mask]] = True
+            expanded_mask[connection_v[expansion_edge_mask]] = True
+        edge_mask = expanded_mask[connection_u] & expanded_mask[connection_v]
+        expanded_res_idx = np.flatnonzero(expanded_mask)
+        expanded_connections = connections[edge_mask]
+        local_to_global = {i: gid for i, gid in enumerate(expanded_res_idx)}
+        global_to_local = {gid: i for i, gid in enumerate(expanded_res_idx)}
+        if len(expanded_connections) > 0:
+            local_connections = np.array(
+                [[global_to_local[i], global_to_local[j]] for i, j in expanded_connections], dtype=np.int64
+            )
+        else:
+            local_connections = np.empty((0, 2), dtype=np.int64)
+        chunk_local_idx = np.array([global_to_local[gid] for gid in chunk_res_idx], dtype=np.int64)
+        cid_hash[cid] = edge_mask
+        cid_meta[cid] = {
+            'connections_': local_connections, 'local_frame_idx': local_frame_idx[edge_mask],
+            'n_residue': len(expanded_res_idx), 'rot': rot[expanded_res_idx].ravel(),
+            'local_to_global': local_to_global, 'connections': expanded_connections,
+            'chunk_res_idx': chunk_res_idx, 'chunk_local_idx': chunk_local_idx,
+            'expanded_res_idx': expanded_res_idx
+        }
     return cid_set, cid_meta, cid_hash
 
 
@@ -109,7 +81,7 @@ def pbc_torch(r, d):
 
 
 def constraint_det(x):
-    """Calculates the determinant constraint error for rotation matrices.
+    r"""Calculates the determinant constraint error for rotation matrices.
 
     Ensures that the determinant of each rotation matrix is 1 (proper rotation).
 
@@ -218,8 +190,8 @@ cons = ({'type': 'eq', 'fun': rot_cons, 'jac': rot_cons_jac, }, cons_det)
 Meta = namedtuple("Meta", "bonds trans_v local_x atom_pos atom_res_id box")
 
 
-def optimize_res_orientation(n_residue, meta, chunk_per_d=1):
-    """Optimizes the orientation of residues to reconnect bonded atoms.
+def optimize_res_orientation(n_residue, meta, chunk_per_d=1, expand_radius=1):
+    r"""Optimizes the orientation of residues to reconnect bonded atoms.
 
         This function finds the optimal rotation matrices $R_i$ for each residue $i$ such
         that the distance between bonded atoms $a \in i$ and $b \in j$ matches the
@@ -246,10 +218,15 @@ def optimize_res_orientation(n_residue, meta, chunk_per_d=1):
             meta (Meta): NamedTuple containing topology and coordinate info.
             chunk_per_d (int, optional): Number of chunks per dimension.
                 If > 1, optimization is performed locally on chunks. Defaults to 1.
+            expand_radius (int, optional): Bonded-graph expansion radius around each
+                spatial chunk. Defaults to 1.
 
         Returns:
             np.ndarray: The optimized rotation matrices of shape (n_residue, 3, 3).
     """
+    total_start = time.perf_counter()
+    total_n_residue = n_residue
+    identity_rot = np.array([np.eye(3), ] * total_n_residue)
     r0 = (np.random.normal(0, 0.01, (
             n_residue * 9)))  # np.tile(np.eye(3), (n_residue, 1, 1)).ravel()# + (np.random.normal(0,0.01,(n_residue * 9)) )
     # r0 = np.concatenate((r0,r0),axis=0)
@@ -268,11 +245,13 @@ def optimize_res_orientation(n_residue, meta, chunk_per_d=1):
     # self.boxt = box_torch
     ##self.trant = trans_torch
     if n_residue == 1:
-        # if 1:
-        return np.array([np.eye(3), ] * n_residue)
+        logger.info("Orientation optimization skipped: only one residue.")
+        return identity_rot
     if len(connections) == 0:
-        logger.warning('molecules with connections in CG without in aa, check your SMARTS')
-        return np.array([np.eye(3), ] * n_residue)
+        logger.warning("Orientation optimization skipped: no inter-residue bonds.")
+        return identity_rot
+    if chunk_per_d > 1 and (not isinstance(expand_radius, (int, np.integer)) or expand_radius < 1):
+        raise ValueError("expand_radius must be a positive integer.")
     # numba free
     # @nb.jit(nopython=True, nogil=True)
     # device = torch.device(0 if torch.cuda.is_available() else 'cpu')
@@ -399,8 +378,6 @@ def optimize_res_orientation(n_residue, meta, chunk_per_d=1):
                 loss = f + p
                 loss.backward()
                 optimizerR.step()
-                logger.info(
-                    f'{torch.abs(rot.grad).sum().item():.6f} cons loss: {Rot_cons(rot, eye).item()}, lam: {lam.item()}')
             constraint_val = Rot_cons(rot, eye).item()
             with torch.no_grad():
                 lam += rho * constraint_val
@@ -411,61 +388,115 @@ def optimize_res_orientation(n_residue, meta, chunk_per_d=1):
             if torch.mean(torch.abs(rot.grad)) < 1e-2 and torch.mean(
                     torch.abs(rot_ - rot)) < 1e-4 and constraint_val < 5e-7:
                 done = True
-            if i % 2 == 0:
-                logger.info(f'rot loss: {torch.mean(torch.abs(rot_ - rot))}, cons loss: {constraint_val}, lam: {lam}')
             if done:
                 break
         return rot.detach().cpu().numpy().ravel(), lam, rho, done
 
-    maxiter, max_count, count = 500, 5, 0
+    def finite_result(result):
+        return np.all(np.isfinite(result.x)) and np.isfinite(result.fun)
+
+    max_retries = 5
     if chunk_per_d <= 1:
-        maxiter, max_count, count = 500, 5, 0
+        logger.info(f"Orientation optimization: residues={total_n_residue}, bonds={len(connections)}.")
         connections_ = connections
-        res = minimize(_loss, r0, constraints=cons, options={'maxiter': maxiter, 'disp': False}, jac=True,
-                       method='trust-constr')
-        while (not res.success) and (count < max_count):
-            maxiter *= 2
-            logger.warning(f"Minimization failed, try increasing maxiter to {maxiter}")
-            r0 = res.x
-            res = minimize(_loss, r0, constraints=cons, options={'maxiter': maxiter, 'disp': False}, jac=True,
-                           method='trust-constr')
-            count += 1
-        if count >= max_count:
-            logger.error("Orientation minimization failed, use the lasted rotation matrix instead.")
-            return res.x.reshape(-1, 3, 3)  # np.array([np.eye(3), ] * n_residue)
-        return res.x.reshape(-1, 3, 3)
-    elif chunk_per_d > 1:
-        logger.info(f"Optimizing orentation by chunk with {chunk_per_d} chunks in each dimension.")
-        cid_set, cid_meta, cid_hash = optimization_by_chunk(chunk_per_d, connections, pos, local_frame_idx, trans, box,
-                                                            r0)
-        maxiter, max_count, count = 100, 5, 0
-        rot_ = np.array([np.eye(3), ] * n_residue)
-        for i, cid in enumerate(cid_set):
-            if cid_meta.get(cid) is None:
+        current_x = r0
+        current_maxiter = 500
+        last_finite_result = None
+        result = None
+        for retry_number in range(max_retries + 1):
+            result = minimize(_loss, current_x, constraints=cons,
+                              options={'maxiter': current_maxiter, 'disp': False}, jac=True,
+                              method='trust-constr')
+            if finite_result(result):
+                last_finite_result = result
+            if result.success and finite_result(result):
+                break
+            if retry_number < max_retries:
+                next_maxiter = current_maxiter * 2
+                logger.warning(
+                    f"Orientation optimization retry {retry_number + 1}/{max_retries}: not converged at maxiter={current_maxiter}; increasing maxiter to {next_maxiter}.")
+                if np.all(np.isfinite(result.x)):
+                    current_x = result.x
+                current_maxiter = next_maxiter
+        if not (result.success and finite_result(result)):
+            if last_finite_result is None:
+                logger.error("Orientation optimization failed: no finite solution; identity orientations are returned.")
+                return identity_rot
+            result = last_finite_result
+            logger.warning(
+                f"Orientation optimization did not converge after {max_retries} retries; the last finite result is retained.")
+        rot_final = result.x.reshape(total_n_residue, 3, 3)
+        n_optimized = total_n_residue
+    else:
+        cid_set, cid_meta, _ = optimization_by_chunk(
+            chunk_per_d, connections, pos, local_frame_idx, trans, box, r0, expand_radius=expand_radius
+        )
+        n_chunks = len(cid_set)
+        max_chunk_nodes = max(len(cid_meta[cid]['chunk_res_idx']) for cid in cid_set)
+        max_expanded_nodes = max(len(cid_meta[cid]['expanded_res_idx']) for cid in cid_set)
+        max_chunk_bonds = max(len(cid_meta[cid]['connections']) for cid in cid_set)
+        logger.info(
+            f"Orientation optimization by chunks: residues={total_n_residue}, bonds={len(connections)}, chunks={n_chunks}.")
+        logger.info(
+            f"Chunk decomposition: max nodes/chunk={max_chunk_nodes}, max expanded nodes/chunk={max_expanded_nodes}, max bonds/chunk={max_chunk_bonds}.")
+        rot_final = identity_rot.copy()
+        n_optimized = 0
+        for chunk_number, cid in enumerate(cid_set, start=1):
+            chunk_meta = cid_meta[cid]
+            n_chunk_nodes = len(chunk_meta['chunk_res_idx'])
+            n_expanded_nodes = len(chunk_meta['expanded_res_idx'])
+            n_chunk_bonds = len(chunk_meta['connections'])
+            logger.info(
+                f"Chunk {chunk_number}/{n_chunks} started: nodes={n_chunk_nodes}, expanded nodes={n_expanded_nodes}, bonds={n_chunk_bonds}.")
+            if n_chunk_bonds == 0:
                 continue
-            logger.info(f"Optimizing orentation chunk {i + 1}/{len(cid_set)}.")
-            # print(cid)
-            r0 = cid_meta[cid]['rot']
-            connections = cid_meta[cid]['connections']
-            connections_ = cid_meta[cid]['connections_']
-            local_frame_idx = cid_meta[cid]['local_frame_idx']
-            local_to_global = cid_meta[cid]['local_to_global']
-            # print(connections)
-            n_residue = cid_meta[cid]['n_residue']
-            res = minimize(_loss, r0, constraints=cons, options={'maxiter': maxiter, 'disp': False}, jac=True,
-                           method='trust-constr')
-            while (not res.success) and (count < max_count):
-                maxiter *= 2
-                logger.warning(f"Chunk {i + 1} Minimization failed, try increasing maxiter to {maxiter}")
-                r0 = res.x
-                # res = minimize(_loss, r0, constraints=cons, options={'maxiter': maxiter, 'disp': True}, jac=False, method='COBYLA')
-                res = minimize(_loss, r0, constraints=cons, options={'maxiter': maxiter, 'disp': False}, jac=True,
-                               method='trust-constr')
-                count += 1
-            if count >= max_count:
-                for ii, r0_ in enumerate(res.x.reshape(-1, 3, 3)):
-                    rot_[local_to_global[ii]] = r0_
-                continue
-            for ii, r0_ in enumerate(res.x.reshape(-1, 3, 3)):
-                rot_[local_to_global[ii]] = r0_
-        return rot_
+            current_x = chunk_meta['rot']
+            connections = chunk_meta['connections']
+            connections_ = chunk_meta['connections_']
+            local_frame_idx = chunk_meta['local_frame_idx']
+            local_to_global = chunk_meta['local_to_global']
+            n_residue = chunk_meta['n_residue']
+            current_maxiter = 100
+            last_finite_result = None
+            result = None
+            for retry_number in range(max_retries + 1):
+                result = minimize(_loss, current_x, constraints=cons,
+                                  options={'maxiter': current_maxiter, 'disp': False}, jac=True,
+                                  method='trust-constr')
+                if finite_result(result):
+                    last_finite_result = result
+                if result.success and finite_result(result):
+                    break
+                if retry_number < max_retries:
+                    next_maxiter = current_maxiter * 2
+                    logger.warning(
+                        f"Chunk {chunk_number}/{n_chunks} retry {retry_number + 1}/{max_retries}: not converged at maxiter={current_maxiter}; increasing maxiter to {next_maxiter}.")
+                    if np.all(np.isfinite(result.x)):
+                        current_x = result.x
+                    current_maxiter = next_maxiter
+            if not (result.success and finite_result(result)):
+                if last_finite_result is None:
+                    logger.error(
+                        f"Chunk {chunk_number}/{n_chunks} failed: no finite solution; node orientations are unchanged.")
+                    continue
+                result = last_finite_result
+                logger.warning(
+                    f"Chunk {chunk_number}/{n_chunks} did not converge after {max_retries} retries; the last finite result is retained.")
+            local_rot = result.x.reshape(n_residue, 3, 3)
+            for local_id in chunk_meta['chunk_local_idx']:
+                rot_final[local_to_global[local_id]] = local_rot[local_id]
+            n_optimized += n_chunk_nodes
+
+    n_unchanged = total_n_residue - n_optimized
+    gram = np.einsum('nij,nkj->nik', rot_final, rot_final)
+    orthogonality_error = np.max(np.linalg.norm(gram - np.eye(3), axis=(1, 2)))
+    determinant_error = np.max(np.abs(np.linalg.det(rot_final) - 1.0))
+    constraint_tolerance = 1.0e-3
+    total_elapsed = time.perf_counter() - total_start
+    if orthogonality_error <= constraint_tolerance and determinant_error <= constraint_tolerance:
+        logger.info(
+            f"Orientation optimization completed: optimized={n_optimized}, unchanged={n_unchanged}, time={total_elapsed:.1f} s, orthogonality={orthogonality_error:.3e}, determinant={determinant_error:.3e}.")
+    else:
+        logger.warning(
+            f"Orientation optimization failed constraint check: optimized={n_optimized}, unchanged={n_unchanged}, time={total_elapsed:.1f} s, orthogonality={orthogonality_error:.3e}, determinant={determinant_error:.3e}, tolerance={constraint_tolerance:.1e}.")
+    return rot_final
