@@ -50,13 +50,13 @@ The configuration contains five main entries:
 |---|---------:|---|
 | `cg_topology_file` |      Yes | CG configuration in XML or GSD format. Systems containing rigid bodies require XML. |
 | `reaction_file` |       No | Text file containing the ordered reaction sequence. Users should provide this file whenever the reaction history is known. If omitted, reactions are inferred by BFS, which may produce an incorrect order for complex crosslinked or reaction-order-dependent systems. |
-| `reactant_config` |      Yes | AA definitions of flexible CG bead types. |
+| `reactant_config` |      Yes | AA definitions of CG bead types. |
 | `reaction_template` |      Yes | Reaction SMARTS and allowed ordered CG reactant types. |
 | `rigid_config` |       No | AA templates and CG-to-AA mappings for rigid bodies. Use `{}` when no rigid body is present. |
 
 #### Flexible reactants
 
-Each flexible CG type must provide at least one molecular source:
+Each non-rigid CG type must provide at least one molecular source:
 
 ```json
 {
@@ -67,7 +67,7 @@ Each flexible CG type must provide at least one molecular source:
 }
 ```
 
-`file` may point to a PDB or SDF file. When both `file` and `smiles` are supplied, the file is used.
+`file` may point to a PDB file. When both `file` and `smiles` are supplied, the file is used.
 
 #### Reaction templates
 
